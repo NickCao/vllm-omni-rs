@@ -132,7 +132,7 @@ impl TtsRouter {
         // Build stage 1 additional_information with speaker/language
         // (pass through from the original request)
         let stage1_req = EngineCoreRequest {
-            request_id: format!("{request_id}-s1"),
+            request_id: request_id.to_string(),
             prompt_token_ids: Some(vec![0; stage1_prompt_len]),
             sampling_params: Some(default_tts_sampling_params()),
             arrival_time: now_secs(),
