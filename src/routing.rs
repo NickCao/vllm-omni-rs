@@ -168,7 +168,7 @@ fn default_tts_sampling_params() -> EngineCoreSamplingParams {
 fn default_code2wav_sampling_params() -> EngineCoreSamplingParams {
     EngineCoreSamplingParams {
         max_tokens: 65536,
-        output_kind: 2, // FINAL_ONLY
+        output_kind: 0, // CUMULATIVE -- stage 1 produces outputs as codec chunks arrive
         ..Default::default()
     }
 }
