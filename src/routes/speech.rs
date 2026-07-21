@@ -3,7 +3,6 @@
 //! Uses TtsRouter for ZMQ-native 2-stage routing.
 //! Zero Python per request.
 
-use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use anyhow::{Context, Result};
@@ -11,8 +10,8 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use tracing::{debug, error};
 use uuid::Uuid;
 use vllm_engine_core_client::protocol::OpaqueValue;
@@ -47,29 +46,22 @@ fn default_response_format() -> String {
     "wav".to_string()
 }
 
-/// Wire format for `additional_information`, matching vllm-omni's
-/// `AdditionalInformationPayload` msgspec struct.
-#[derive(Serialize)]
-struct AdditionalInformation {
-    entries: BTreeMap<&'static str, InfoEntry>,
-}
-
-#[derive(Serialize, Default)]
-struct InfoEntry {
-    tensor_data: Option<Vec<u8>>,
-    tensor_shape: Option<Vec<u32>>,
-    tensor_dtype: Option<String>,
-    list_data: Vec<String>,
-    scalar_data: Option<f64>,
-}
-
-impl InfoEntry {
-    fn text(value: impl Into<String>) -> Self {
-        Self {
-            list_data: vec![value.into()],
-            ..Default::default()
-        }
-    }
+/// One entry of vllm-omni's `AdditionalInformationPayload` wire struct.
+///
+/// Built through `serde_json::Value` rather than a `#[derive(Serialize)]`
+/// struct: `rmpv::ext`'s serializer encodes plain structs as msgpack
+/// arrays (matching vLLM's `array_like=True` convention elsewhere), but
+/// `AdditionalInformationPayload` is a plain dict on the Python side and
+/// must round-trip as a msgpack map. `serde_json::Value` serializes
+/// objects through `serialize_map`, which `rmpv::ext` does encode as a map.
+fn text_entry(value: impl Into<String>) -> Value {
+    json!({
+        "tensor_data": null,
+        "tensor_shape": null,
+        "tensor_dtype": null,
+        "list_data": [value.into()],
+        "scalar_data": null,
+    })
 }
 
 pub async fn create_speech(
@@ -98,18 +90,16 @@ pub async fn create_speech(
         .unwrap_or("Auto");
     let speaker = req.voice.as_deref().unwrap_or("Vivian");
 
-    let mut entries = BTreeMap::from([
-        ("text", InfoEntry::text(req.input.clone())),
-        ("task_type", InfoEntry::text(task_type)),
-        ("language", InfoEntry::text(language)),
-        ("speaker", InfoEntry::text(speaker)),
-    ]);
+    let mut entries = serde_json::Map::new();
+    entries.insert("text".to_string(), text_entry(req.input.clone()));
+    entries.insert("task_type".to_string(), text_entry(task_type));
+    entries.insert("language".to_string(), text_entry(language));
+    entries.insert("speaker".to_string(), text_entry(speaker));
     if let Some(ref inst) = req.instructions {
-        entries.insert("instruct", InfoEntry::text(inst.clone()));
+        entries.insert("instruct".to_string(), text_entry(inst.clone()));
     }
 
-    let additional_info: OpaqueValue = match rmpv::ext::to_value(&AdditionalInformation { entries })
-    {
+    let additional_info: OpaqueValue = match rmpv::ext::to_value(&json!({ "entries": entries })) {
         Ok(v) => v,
         Err(e) => {
             return error_response(
