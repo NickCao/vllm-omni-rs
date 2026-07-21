@@ -12,6 +12,84 @@ use anyhow::{Context, Result, bail};
 use tracing::info;
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 
+/// A model's chat template plus the special tokens its Jinja template
+/// typically references.
+#[derive(Debug, serde::Deserialize)]
+pub struct ChatTemplateInfo {
+    pub template: String,
+    #[serde(default)]
+    pub bos_token: Option<String>,
+    #[serde(default)]
+    pub eos_token: Option<String>,
+}
+
+/// Extract a model's chat template using a one-time Python call. Some
+/// models (e.g. Qwen3-Omni) don't expose `chat_template` on their
+/// tokenizer at all -- it only lives on the multimodal `AutoProcessor` --
+/// so this tries the tokenizer first and falls back to the processor.
+/// Returns `Ok(None)`, not an error, if neither has one: a pipeline with
+/// a text-output stage but no discoverable template just can't serve
+/// chat completions, which isn't a startup failure.
+pub fn extract_chat_template(model: &str) -> Result<Option<ChatTemplateInfo>> {
+    let path = format!(
+        "/tmp/_vllm_omni_rs_chat_template_{}.json",
+        model.replace('/', "_")
+    );
+    if std::path::Path::new(&path).exists() {
+        info!("Using cached chat template info: {path}");
+        let contents =
+            std::fs::read_to_string(&path).context("failed to read cached chat template")?;
+        let info: Option<ChatTemplateInfo> =
+            serde_json::from_str(&contents).context("failed to parse cached chat template")?;
+        return Ok(info);
+    }
+    // `if`/`try`/`except` need real indented blocks, unlike the simple
+    // semicolon-chained one-liners used elsewhere in this file -- so this
+    // script is genuine multi-line Python, not a flattened single line.
+    const SCRIPT: &str = r#"
+import sys, json
+
+def get_template():
+    from transformers import AutoTokenizer, AutoProcessor
+    tok = AutoTokenizer.from_pretrained(sys.argv[1], trust_remote_code=True)
+    template = tok.chat_template
+    if isinstance(template, str):
+        return template, tok.bos_token, tok.eos_token
+    try:
+        proc = AutoProcessor.from_pretrained(sys.argv[1], trust_remote_code=True)
+        candidate = getattr(proc, "chat_template", None)
+    except Exception:
+        candidate = None
+    return candidate if isinstance(candidate, str) else None, tok.bos_token, tok.eos_token
+
+template, bos_token, eos_token = get_template()
+out = None if template is None else {"template": template, "bos_token": bos_token, "eos_token": eos_token}
+sys.stderr.write("===VLLM_OMNI_RS_JSON_START===\n" + json.dumps(out) + "\n===VLLM_OMNI_RS_JSON_END===\n")
+"#;
+    let output = Command::new("python3")
+        .args(["-c", SCRIPT, model])
+        .output()
+        .context("failed to run python3 for chat template extraction")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("chat template extraction failed: {stderr}");
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let json_str = stderr
+        .split("===VLLM_OMNI_RS_JSON_START===\n")
+        .nth(1)
+        .and_then(|s| s.split("\n===VLLM_OMNI_RS_JSON_END===").next())
+        .context("chat template extraction output missing JSON markers")?;
+    std::fs::write(&path, json_str).context("failed to cache chat template info")?;
+    let info: Option<ChatTemplateInfo> =
+        serde_json::from_str(json_str).context("failed to parse extracted chat template")?;
+    match &info {
+        Some(_) => info!("Extracted chat template to {path}"),
+        None => info!("Model has no discoverable chat template"),
+    }
+    Ok(info)
+}
+
 /// Extract tokenizer.json from the model using a one-time Python call.
 /// The HF repo doesn't ship tokenizer.json but the Python tokenizer
 /// builds one from vocab.json + merges.txt.
@@ -48,7 +126,7 @@ pub fn extract_tokenizer(model: &str) -> Result<String> {
 /// Every field is optional because different stages/models set different
 /// subsets -- anything unset here keeps `EngineCoreSamplingParams`'s own
 /// default.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, Clone, serde::Deserialize)]
 pub struct StageSamplingDefaults {
     #[serde(default)]
     pub temperature: Option<f32>,
@@ -73,12 +151,39 @@ pub struct StageSamplingDefaults {
     pub detokenize: Option<bool>,
 }
 
+/// Per-request sampling overrides for a chat completion, applied only to
+/// the root/comprehension stage -- matching vllm-omni's own
+/// `_apply_request_overrides`, which never lets a client-set sampling
+/// field reach downstream stages (talker, code2wav). `stop` forwards
+/// directly into `EngineCoreSamplingParams.stop: Vec<String>`; engine-core
+/// already supports string stop sequences server-side, so no client-side
+/// tokenization is needed.
+#[derive(Debug, Default, Clone)]
+pub struct SamplingOverrides {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<i64>,
+    pub max_tokens: Option<u32>,
+    pub min_tokens: Option<u32>,
+    pub seed: Option<i64>,
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub stop: Option<Vec<String>>,
+    pub ignore_eos: Option<bool>,
+}
+
 impl StageSamplingDefaults {
     /// Build sampling params for one request. `output_kind` is not part of
     /// the introspected model config -- it's this frontend's own choice of
     /// how to consume the output stream (FINAL_ONLY vs DELTA), so it's
-    /// passed in rather than looked up.
-    pub fn to_sampling_params(&self, output_kind: u8) -> EngineCoreSamplingParams {
+    /// passed in rather than looked up. `overrides` is `None` for every
+    /// stage except a chat completion's root stage, which the client is
+    /// allowed to steer via OpenAI-style request fields.
+    pub fn to_sampling_params(
+        &self,
+        output_kind: u8,
+        overrides: Option<&SamplingOverrides>,
+    ) -> EngineCoreSamplingParams {
         let mut params = EngineCoreSamplingParams {
             output_kind,
             ..Default::default()
@@ -107,6 +212,38 @@ impl StageSamplingDefaults {
         }
         if let Some(v) = self.detokenize {
             params.detokenize = v;
+        }
+        if let Some(o) = overrides {
+            if let Some(v) = o.temperature {
+                params.temperature = v;
+            }
+            if let Some(v) = o.top_p {
+                params.top_p = v;
+            }
+            if let Some(v) = o.top_k {
+                params.top_k = v.max(0) as u32;
+            }
+            if let Some(v) = o.max_tokens {
+                params.max_tokens = v;
+            }
+            if let Some(v) = o.min_tokens {
+                params.min_tokens = v;
+            }
+            if let Some(v) = o.seed {
+                params.seed = Some(v);
+            }
+            if let Some(v) = o.presence_penalty {
+                params.presence_penalty = v;
+            }
+            if let Some(v) = o.frequency_penalty {
+                params.frequency_penalty = v;
+            }
+            if let Some(ref stop) = o.stop {
+                params.stop = stop.clone();
+            }
+            if let Some(v) = o.ignore_eos {
+                params.ignore_eos = v;
+            }
         }
         params
     }

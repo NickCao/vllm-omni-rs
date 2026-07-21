@@ -1,13 +1,14 @@
-//! vllm-omni-rs: Pure Rust HTTP frontend for vllm-omni TTS.
+//! vllm-omni-rs: Pure Rust HTTP frontend for vllm-omni.
 //!
 //! Architecture:
 //!   Rust (this binary):
-//!     - HTTP server (axum)
+//!     - HTTP server (axum): POST /v1/audio/speech, POST /v1/chat/completions
 //!     - OmniMasterServer (ZMQ registration)
 //!     - EngineCoreClient per stage (ZMQ communication)
 //!     - Topology-driven routing across however many stages the pipeline
-//!       declares (e.g. Qwen3-TTS: talker -> code2wav)
-//!     - Audio encoding (WAV/PCM)
+//!       declares (e.g. Qwen3-TTS: talker -> code2wav; Qwen3-Omni:
+//!       thinker -> talker -> code2wav)
+//!     - Chat template rendering (minijinja) and audio encoding (WAV/PCM)
 //!     - Tokenizer (vllm-tokenizer)
 //!   Python (headless subprocesses, inference only): one process per stage,
 //!   spawned with the stage IDs vllm-omni's own pipeline config declares.
@@ -15,6 +16,8 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod audio;
+mod chat_template;
 mod introspect;
 mod master;
 mod routes;
@@ -28,12 +31,14 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 use vllm_managed_engine::allocate_handshake_port;
+use vllm_tokenizer::HuggingFaceTokenizer;
 
-use crate::introspect::{extract_tokenizer, introspect_pipeline_topology};
+use crate::chat_template::ChatTemplateRenderer;
+use crate::introspect::{extract_chat_template, extract_tokenizer, introspect_pipeline_topology};
 use crate::master::start_and_connect_stages;
-use crate::routing::TtsRouter;
+use crate::routing::PipelineRouter;
 use crate::stages::{StageSpawnConfig, shutdown_stages, spawn_stages};
 
 #[derive(Parser)]
@@ -131,21 +136,44 @@ fn main() -> Result<()> {
             connected_stages.len()
         );
 
-        // 5. Create TTS router
+        // 5. Load the tokenizer and build the router
         let tokenizer_path = match cli.tokenizer_path {
             Some(path) => path,
             None => extract_tokenizer(&cli.model)
                 .context("No --tokenizer-path given and auto-extraction failed")?,
         };
+        let tokenizer = Arc::new(
+            HuggingFaceTokenizer::new(std::path::Path::new(&tokenizer_path))
+                .with_context(|| format!("Failed to load tokenizer from {tokenizer_path}"))?,
+        );
+        info!("Tokenizer loaded from {tokenizer_path}");
         let router = Arc::new(
-            TtsRouter::new(connected_stages, &tokenizer_path, &topology)
-                .context("Failed to create TTS router")?,
+            PipelineRouter::new(connected_stages, Arc::clone(&tokenizer), &topology)
+                .context("Failed to create pipeline router")?,
         );
 
-        // 6. Start HTTP server
+        // 6. If the pipeline has a text-output stage, try to load a chat
+        // template for it. A missing template isn't a startup failure --
+        // /v1/chat/completions just returns 501 for this model.
+        let has_text_stage = topology.values().any(|t| t.final_output_type.as_deref() == Some("text"));
+        let chat_template = if has_text_stage {
+            match extract_chat_template(&cli.model).context("Failed to introspect chat template")? {
+                Some(info) => Some(Arc::new(ChatTemplateRenderer::new(info.template, info.bos_token, info.eos_token)?)),
+                None => {
+                    warn!("Model has a text-output stage but no chat template was found; /v1/chat/completions will 501");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // 7. Start HTTP server
         let state = server::AppState {
             model_name: cli.model.clone(),
             router: Arc::clone(&router),
+            tokenizer,
+            chat_template,
         };
         let app = server::build_router(state);
 
@@ -160,7 +188,7 @@ fn main() -> Result<()> {
             .await
             .context("Server error")?;
 
-        // 7. Cleanup
+        // 8. Cleanup
         info!("Shutting down...");
         if let Ok(r) = Arc::try_unwrap(router) {
             let _ = r.shutdown();
