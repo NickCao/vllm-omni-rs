@@ -120,6 +120,7 @@ impl TtsRouter {
         let stage1_req = EngineCoreRequest {
             request_id: format!("{request_id}-s1"),
             prompt_token_ids: Some(vec![0; stage1_prompt_len]),
+            sampling_params: Some(default_tts_sampling_params()),
             arrival_time: now_secs(),
             additional_information: Some(additional_info),
             external_req_id: Some(request_id.to_string()),
