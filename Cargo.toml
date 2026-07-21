@@ -36,10 +36,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 
-# Upstream vLLM Rust crates
-vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm", rev = "8950394e0" }
+# Vendored vLLM crates (with omni extensions)
+vllm-engine-core-client = { path = "vendor/engine-core-client" }
+vllm-metrics = { path = "vendor/metrics" }
+
+# Upstream vLLM Rust crates (unmodified)
 vllm-managed-engine = { git = "https://github.com/vllm-project/vllm", rev = "8950394e0" }
-vllm-metrics = { git = "https://github.com/vllm-project/vllm", rev = "8950394e0" }
 vllm-tokenizer = { git = "https://github.com/vllm-project/vllm", rev = "8950394e0" }
 rmp-serde = "1.3"
 rmpv = { version = "1.3", features = ["with-serde"] }

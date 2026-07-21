@@ -1,0 +1,9 @@
+[package]
+name = "vllm-metrics"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+itertools = "0.14"
+prometheus-client = "0.24"
