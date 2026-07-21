@@ -112,14 +112,39 @@ impl StageSamplingDefaults {
     }
 }
 
-/// Resolve each stage's `default_sampling_params` the same way vllm-omni's
-/// own `run_headless()` does: `load_and_resolve_stage_configs` merges the
-/// deploy YAML with the model's pipeline-topology sampling constraints, so
+/// One stage's position in the pipeline DAG plus its resolved sampling
+/// defaults, as vllm-omni's own `StagePipelineConfig`/deploy-YAML merge
+/// produces them (see `vllm_omni.config.stage_config.StageConfig.to_omegaconf`).
+///
+/// `engine_input_source` is vllm-omni's own (legacy-named) field for which
+/// stage(s) feed this one via the async_chunk connector; empty means this
+/// stage takes the request's real prompt directly. Every pipeline seen so
+/// far (Qwen3-TTS, CosyVoice3, Higgs-Audio v2/v3, GLM-TTS, Fish-Speech,
+/// Qwen3-Omni) is a linear chain -- at most one upstream source per stage --
+/// so a router only needs to distinguish "has an upstream source" from
+/// "doesn't," not walk a general DAG.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct StageTopology {
+    #[serde(default)]
+    pub default_sampling_params: StageSamplingDefaults,
+    #[serde(default)]
+    pub engine_input_source: Vec<u32>,
+    #[serde(default)]
+    pub final_output_type: Option<String>,
+}
+
+impl StageTopology {
+    pub fn is_root(&self) -> bool {
+        self.engine_input_source.is_empty()
+    }
+}
+
+/// Resolve the full pipeline topology (sampling params + stage wiring) the
+/// same way vllm-omni's own `run_headless()` does: `load_and_resolve_stage_configs`
+/// merges the deploy YAML with the model's pipeline-topology metadata, so
 /// this reads whatever the model actually declares instead of guessing at
-/// per-model tuning values from Rust.
-pub fn introspect_stage_sampling_params(
-    model: &str,
-) -> Result<HashMap<u32, StageSamplingDefaults>> {
+/// stage count, roles, or per-model tuning values from Rust.
+pub fn introspect_pipeline_topology(model: &str) -> Result<HashMap<u32, StageTopology>> {
     // Log noise from vllm-omni's own imports can land on either stream, so
     // the JSON payload is wrapped in unambiguous markers on stderr instead
     // of relying on stdout being clean.
@@ -127,31 +152,43 @@ pub fn introspect_stage_sampling_params(
         from omegaconf import OmegaConf; \
         from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs; \
         _, stage_configs, _ = load_and_resolve_stage_configs(sys.argv[1], None, {}); \
-        out = {str(cfg.stage_id): OmegaConf.to_container(cfg.default_sampling_params, resolve=True) for cfg in stage_configs}; \
+        out = {str(cfg.stage_id): { \
+            'default_sampling_params': OmegaConf.to_container(cfg.get('default_sampling_params', {}), resolve=True), \
+            'engine_input_source': OmegaConf.to_container(cfg.engine_input_source, resolve=True), \
+            'final_output_type': cfg.final_output_type, \
+        } for cfg in stage_configs}; \
         sys.stderr.write('===VLLM_OMNI_RS_JSON_START===\\n' + json.dumps(out) + '\\n===VLLM_OMNI_RS_JSON_END===\\n')";
     let output = Command::new("python3")
         .args(["-c", SCRIPT, model])
         .output()
-        .context("failed to run python3 for stage config introspection")?;
+        .context("failed to run python3 for pipeline topology introspection")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("stage config introspection failed: {stderr}");
+        bail!("pipeline topology introspection failed: {stderr}");
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let json_str = stderr
         .split("===VLLM_OMNI_RS_JSON_START===\n")
         .nth(1)
         .and_then(|s| s.split("\n===VLLM_OMNI_RS_JSON_END===").next())
-        .context("stage config introspection output missing JSON markers")?;
-    let raw: HashMap<String, StageSamplingDefaults> =
-        serde_json::from_str(json_str).context("failed to parse introspected sampling params")?;
+        .context("pipeline topology introspection output missing JSON markers")?;
+    let raw: HashMap<String, StageTopology> =
+        serde_json::from_str(json_str).context("failed to parse introspected pipeline topology")?;
     let mut result = HashMap::with_capacity(raw.len());
-    for (stage_id, defaults) in raw {
+    for (stage_id, topology) in raw {
         let stage_id: u32 = stage_id
             .parse()
             .with_context(|| format!("invalid stage_id in introspection output: {stage_id:?}"))?;
-        info!("Stage {stage_id} sampling defaults: {defaults:?}");
-        result.insert(stage_id, defaults);
+        info!(
+            "Stage {stage_id}: input_source={:?}, final_output_type={:?}, sampling={:?}",
+            topology.engine_input_source,
+            topology.final_output_type,
+            topology.default_sampling_params
+        );
+        result.insert(stage_id, topology);
+    }
+    if result.is_empty() {
+        bail!("pipeline topology introspection returned no stages for model {model:?}");
     }
     Ok(result)
 }

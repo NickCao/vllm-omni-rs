@@ -1,8 +1,13 @@
-//! 2-stage TTS routing: Talker (stage 0) -> Code2Wav (stage 1).
+//! Topology-driven pipeline routing.
 //!
-//! With async_chunk enabled, workers handle inter-stage codec transfer
-//! via SharedMemoryConnector. This router submits requests to both stages
-//! and collects audio from stage 1.
+//! Handles any linear chain of stages wired via vllm-omni's async_chunk
+//! connector (Qwen3-TTS's 2-stage Talker -> Code2Wav, Qwen3-Omni's 3-stage
+//! Thinker -> Talker -> Code2Wav, etc.) -- not just a hardcoded 2-stage
+//! pair. Root stages (no upstream source) get the request's real prompt;
+//! downstream stages get a placeholder the connector extends as upstream
+//! output arrives. Workers handle the actual codec transfer via
+//! SharedMemoryConnector; this router only submits requests and collects
+//! output from whichever stage produces audio.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -11,79 +16,109 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use tracing::{debug, info};
-use vllm_engine_core_client::EngineCoreClient;
 use vllm_engine_core_client::protocol::OpaqueValue;
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
+use vllm_engine_core_client::{EngineCoreClient, EngineCoreOutputStream};
 use vllm_tokenizer::{HuggingFaceTokenizer, Tokenizer};
 
-use crate::introspect::StageSamplingDefaults;
+use crate::introspect::StageTopology;
 use crate::master::ConnectedStage;
 
 // EngineCoreOutput.output_kind wire values.
 const OUTPUT_KIND_DELTA: u8 = 1;
 const OUTPUT_KIND_FINAL_ONLY: u8 = 2;
 
+struct Stage {
+    stage_id: u32,
+    client: EngineCoreClient,
+    /// No upstream source -- gets the request's real prompt directly,
+    /// rather than a connector-fed placeholder.
+    is_root: bool,
+    sampling: EngineCoreSamplingParams,
+}
+
 pub struct TtsRouter {
-    stage0: EngineCoreClient,
-    stage1: EngineCoreClient,
+    /// Ordered by stage_id, which is also submission/drain order.
+    stages: Vec<Stage>,
+    audio_stage_id: u32,
     tokenizer: HuggingFaceTokenizer,
-    stage0_sampling: EngineCoreSamplingParams,
-    stage1_sampling: EngineCoreSamplingParams,
 }
 
 impl TtsRouter {
     pub fn new(
         stages: Vec<ConnectedStage>,
         tokenizer_path: &str,
-        stage_sampling_defaults: &HashMap<u32, StageSamplingDefaults>,
+        topology: &HashMap<u32, StageTopology>,
     ) -> Result<Self> {
-        if stages.len() != 2 {
-            bail!("TTS requires 2 stages, got {}", stages.len());
+        if stages.is_empty() {
+            bail!("pipeline requires at least 1 stage, got 0");
         }
-        let mut stage0 = None;
-        let mut stage1 = None;
+        if stages.len() != topology.len() {
+            bail!(
+                "connected {} stage(s) but pipeline topology declares {}",
+                stages.len(),
+                topology.len()
+            );
+        }
+
+        let audio_stages: Vec<u32> = topology
+            .iter()
+            .filter(|(_, t)| t.final_output_type.as_deref() == Some("audio"))
+            .map(|(id, _)| *id)
+            .collect();
+        let audio_stage_id = match audio_stages.as_slice() {
+            [id] => *id,
+            [] => bail!("no stage in the pipeline has final_output_type=\"audio\""),
+            ids => bail!("expected exactly one audio-output stage, found {ids:?}"),
+        };
+
+        let mut built = Vec::with_capacity(stages.len());
         for s in stages {
-            match s.stage_id {
-                0 => stage0 = Some(s.client),
-                1 => stage1 = Some(s.client),
-                id => bail!("Unexpected stage_id: {id}"),
-            }
+            let t = topology.get(&s.stage_id).with_context(|| {
+                format!(
+                    "stage {} connected but missing from introspected topology",
+                    s.stage_id
+                )
+            })?;
+            // The audio stage streams incrementally, so its output must be
+            // DELTA for generate_speech's chunk accumulation to see each
+            // new slice. Every other stage only needs its final token
+            // count, so FINAL_ONLY avoids per-step deltas we'd discard
+            // anyway. This is a choice about how *we* consume the stream,
+            // not part of the model's own config, so it's applied here
+            // rather than looked up from the introspected topology.
+            let output_kind = if s.stage_id == audio_stage_id {
+                OUTPUT_KIND_DELTA
+            } else {
+                OUTPUT_KIND_FINAL_ONLY
+            };
+            built.push(Stage {
+                stage_id: s.stage_id,
+                client: s.client,
+                is_root: t.is_root(),
+                sampling: t.default_sampling_params.to_sampling_params(output_kind),
+            });
         }
+        built.sort_by_key(|s| s.stage_id);
 
         let tokenizer = HuggingFaceTokenizer::new(Path::new(tokenizer_path))
             .context(format!("Failed to load tokenizer from {tokenizer_path}"))?;
         info!("Tokenizer loaded from {tokenizer_path}");
 
-        // Stage 0 (talker) only needs the total token count once it's done,
-        // so FINAL_ONLY avoids per-step deltas we'd discard anyway. Stage 1
-        // (code2wav) streams audio incrementally, so its output must be
-        // DELTA for generate_speech's chunk accumulation to see each new
-        // slice. This is a choice about how *we* consume the stream, not
-        // part of the model's own config, so it's applied here rather than
-        // looked up from stage_sampling_defaults.
-        let empty = StageSamplingDefaults::default();
-        let stage0_sampling = stage_sampling_defaults
-            .get(&0)
-            .unwrap_or(&empty)
-            .to_sampling_params(OUTPUT_KIND_FINAL_ONLY);
-        let stage1_sampling = stage_sampling_defaults
-            .get(&1)
-            .unwrap_or(&empty)
-            .to_sampling_params(OUTPUT_KIND_DELTA);
-
         Ok(Self {
-            stage0: stage0.context("Stage 0 not found")?,
-            stage1: stage1.context("Stage 1 not found")?,
+            stages: built,
+            audio_stage_id,
             tokenizer,
-            stage0_sampling,
-            stage1_sampling,
         })
     }
 
-    /// Generate speech. Submit to both stages concurrently (async_chunk mode).
-    /// Stage 0 generates codec tokens, workers transfer via /dev/shm,
-    /// stage 1 generates audio.
+    /// Generate speech. Submits every stage in the pipeline concurrently
+    /// (async_chunk mode), matching what vllm-omni's Python orchestrator
+    /// does in `_prewarm_async_chunk_stages`. Root stages get the real
+    /// prompt; downstream stages get a placeholder the connector extends
+    /// as upstream output arrives via /dev/shm -- Rust never touches that
+    /// transfer directly.
     pub async fn generate_speech(
         &self,
         request_id: &str,
@@ -92,67 +127,70 @@ impl TtsRouter {
     ) -> Result<Vec<OpaqueValue>> {
         let start = Instant::now();
 
-        // Submit stage 0 (talker)
-        let stage0_req = EngineCoreRequest {
-            request_id: request_id.to_string(),
-            prompt_token_ids: Some(prompt_token_ids),
-            sampling_params: Some(self.stage0_sampling.clone()),
-            arrival_time: now_secs(),
-            additional_information: Some(additional_info.clone()),
-            external_req_id: Some(request_id.to_string()),
-            ..Default::default()
-        };
-
-        debug!("[{request_id}] Submitting to stage 0 (talker)");
-        let mut stream0 = self
-            .stage0
-            .call(stage0_req)
-            .await
-            .context("Stage 0 call failed")?;
-
-        // Submit stage 1 (code2wav) with a minimal placeholder.
-        // Python's _prewarm_async_chunk_stages uses
-        // compute_talker_prompt_ids_length(stage0_prompt) which returns 1
-        // for placeholder prompts. The actual codec data arrives via the
-        // connector and the scheduler dynamically extends the request.
-        let stage1_prompt_len = 1usize;
-        let stage1_req = EngineCoreRequest {
-            request_id: request_id.to_string(),
-            prompt_token_ids: Some(vec![0; stage1_prompt_len]),
-            sampling_params: Some(self.stage1_sampling.clone()),
-            arrival_time: now_secs(),
-            additional_information: Some(additional_info),
-            external_req_id: Some(request_id.to_string()),
-            resumable: true, // async_chunk streaming input
-            ..Default::default()
-        };
-
-        debug!("[{request_id}] Submitting to stage 1 (code2wav)");
-        let mut stream1 = self
-            .stage1
-            .call(stage1_req)
-            .await
-            .context("Stage 1 call failed")?;
-
-        // Wait for stage 0 to finish (generates codec tokens)
-        let mut token_count = 0u64;
-        while let Some(result) = stream0.next().await {
-            let output = result.context("Stage 0 stream error")?;
-            token_count += output.new_token_ids.len() as u64;
-            if output.finished() {
-                break;
-            }
+        let mut streams: Vec<(u32, EngineCoreOutputStream)> = Vec::with_capacity(self.stages.len());
+        for stage in &self.stages {
+            // Python's _prewarm_async_chunk_stages uses
+            // compute_talker_prompt_ids_length(stage0_prompt), which
+            // returns 1 for placeholder prompts on any downstream stage --
+            // this isn't specific to code2wav.
+            let (prompt, resumable) = if stage.is_root {
+                (prompt_token_ids.clone(), false)
+            } else {
+                (vec![0u32; 1], true)
+            };
+            let req = EngineCoreRequest {
+                request_id: request_id.to_string(),
+                prompt_token_ids: Some(prompt),
+                sampling_params: Some(stage.sampling.clone()),
+                arrival_time: now_secs(),
+                additional_information: Some(additional_info.clone()),
+                external_req_id: Some(request_id.to_string()),
+                resumable,
+                ..Default::default()
+            };
+            debug!("[{request_id}] Submitting to stage {}", stage.stage_id);
+            let stream = stage
+                .client
+                .call(req)
+                .await
+                .with_context(|| format!("Stage {} call failed", stage.stage_id))?;
+            streams.push((stage.stage_id, stream));
         }
-        let stage0_ms = start.elapsed().as_millis();
-        info!("[{request_id}] Stage 0 done: {token_count} tokens, {stage0_ms}ms");
 
-        // Collect stage 1 output (audio). Stage 1 uses DELTA output_kind,
-        // so each multimodal_output is a NEW chunk of audio, not the full
-        // buffer -- these must be accumulated, not overwritten, matching
-        // the Python frontend's torch.cat over all streamed chunks.
+        // Drain every non-audio stage to completion first (only used for
+        // logging), then the audio stage last. This preserves the original
+        // 2-stage drain order that was verified to work end to end; the
+        // actual codec transfer between stages happens out-of-band via
+        // /dev/shm regardless of the order Rust polls each stream in.
+        let mut audio_stream: Option<EngineCoreOutputStream> = None;
+        for (stage_id, mut stream) in streams {
+            if stage_id == self.audio_stage_id {
+                audio_stream = Some(stream);
+                continue;
+            }
+            let mut token_count = 0u64;
+            while let Some(result) = stream.next().await {
+                let output = result.with_context(|| format!("Stage {stage_id} stream error"))?;
+                token_count += output.new_token_ids.len() as u64;
+                if output.finished() {
+                    break;
+                }
+            }
+            info!(
+                "[{request_id}] Stage {stage_id} done: {token_count} tokens, {}ms",
+                start.elapsed().as_millis()
+            );
+        }
+
+        // Stage output uses DELTA output_kind, so each multimodal_output is
+        // a NEW chunk of audio, not the full buffer -- these must be
+        // accumulated, not overwritten, matching the Python frontend's
+        // torch.cat over all streamed chunks.
+        let mut audio_stream =
+            audio_stream.context("audio stage stream missing after submission")?;
         let mut audio_chunks: Vec<OpaqueValue> = Vec::new();
-        while let Some(result) = stream1.next().await {
-            let output = result.context("Stage 1 stream error")?;
+        while let Some(result) = audio_stream.next().await {
+            let output = result.context("audio stage stream error")?;
             if let Some(mm) = output.multimodal_output.clone() {
                 audio_chunks.push(mm);
             }
@@ -191,8 +229,9 @@ impl TtsRouter {
 
     pub fn shutdown(self) -> Result<()> {
         tokio::spawn(async move {
-            let _ = self.stage0.shutdown().await;
-            let _ = self.stage1.shutdown().await;
+            for stage in self.stages {
+                let _ = stage.client.shutdown().await;
+            }
         });
         Ok(())
     }

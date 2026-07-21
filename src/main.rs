@@ -5,12 +5,12 @@
 //!     - HTTP server (axum)
 //!     - OmniMasterServer (ZMQ registration)
 //!     - EngineCoreClient per stage (ZMQ communication)
-//!     - 2-stage routing (talker -> code2wav)
+//!     - Topology-driven routing across however many stages the pipeline
+//!       declares (e.g. Qwen3-TTS: talker -> code2wav)
 //!     - Audio encoding (WAV/PCM)
 //!     - Tokenizer (vllm-tokenizer)
-//!   Python (headless subprocesses, inference only):
-//!     - Stage 0: Talker (autoregressive codec generation)
-//!     - Stage 1: Code2Wav (vocoder)
+//!   Python (headless subprocesses, inference only): one process per stage,
+//!   spawned with the stage IDs vllm-omni's own pipeline config declares.
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -31,7 +31,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 use vllm_managed_engine::allocate_handshake_port;
 
-use crate::introspect::{extract_tokenizer, introspect_stage_sampling_params};
+use crate::introspect::{extract_tokenizer, introspect_pipeline_topology};
 use crate::master::start_and_connect_stages;
 use crate::routing::TtsRouter;
 use crate::stages::{StageSpawnConfig, shutdown_stages, spawn_stages};
@@ -88,13 +88,21 @@ fn main() -> Result<()> {
         .context("Failed to build tokio runtime")?;
 
     rt.block_on(async move {
-        // 1. Allocate master registration port
+        // 1. Introspect the pipeline topology (stage count, roles, sampling
+        // defaults) before spawning anything, since that's what determines
+        // which stage IDs to spawn -- not a hardcoded list.
+        let topology = introspect_pipeline_topology(&cli.model)
+            .context("Failed to introspect pipeline topology")?;
+        let mut stage_ids: Vec<u32> = topology.keys().copied().collect();
+        stage_ids.sort_unstable();
+        info!("Pipeline stages for {}: {:?}", cli.model, stage_ids);
+
+        // 2. Allocate master registration port
         let master_port =
             allocate_handshake_port(&cli.master_host).context("Failed to allocate master port")?;
         info!("Master registration port: {master_port}");
 
-        // 2. Spawn headless Python stages
-        let stage_ids = vec![0, 1]; // Qwen3 TTS: talker + code2wav
+        // 3. Spawn headless Python stages
         let spawn_config = StageSpawnConfig {
             model: cli.model.clone(),
             master_host: cli.master_host.clone(),
@@ -106,7 +114,7 @@ fn main() -> Result<()> {
             .await
             .context("Failed to spawn headless stages")?;
 
-        // 3. Accept registrations + perform handshake with each engine core
+        // 4. Accept registrations + perform handshake with each engine core
         let timeout = Duration::from_secs(cli.handshake_timeout);
         let connected_stages = start_and_connect_stages(
             &cli.master_host,
@@ -123,20 +131,18 @@ fn main() -> Result<()> {
             connected_stages.len()
         );
 
-        // 4. Create TTS router
+        // 5. Create TTS router
         let tokenizer_path = match cli.tokenizer_path {
             Some(path) => path,
             None => extract_tokenizer(&cli.model)
                 .context("No --tokenizer-path given and auto-extraction failed")?,
         };
-        let stage_sampling_defaults = introspect_stage_sampling_params(&cli.model)
-            .context("Failed to introspect per-stage sampling defaults")?;
         let router = Arc::new(
-            TtsRouter::new(connected_stages, &tokenizer_path, &stage_sampling_defaults)
+            TtsRouter::new(connected_stages, &tokenizer_path, &topology)
                 .context("Failed to create TTS router")?,
         );
 
-        // 5. Start HTTP server
+        // 6. Start HTTP server
         let state = server::AppState {
             model_name: cli.model.clone(),
             router: Arc::clone(&router),
@@ -154,7 +160,7 @@ fn main() -> Result<()> {
             .await
             .context("Server error")?;
 
-        // 6. Cleanup
+        // 7. Cleanup
         info!("Shutting down...");
         if let Ok(r) = Arc::try_unwrap(router) {
             let _ = r.shutdown();
