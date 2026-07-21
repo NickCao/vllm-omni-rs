@@ -27,6 +27,7 @@ async-stream = "0.3"
 base64 = "0.22"
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 num_cpus = "1"
+tokenizers = { version = "0.22", features = ["http"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 tokio-stream = "0.1"
 tower = { version = "0.5", features = ["util"] }

@@ -12,6 +12,7 @@ use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3_async_runtimes::TaskLocals;
+use tokenizers::Tokenizer;
 use tracing::info;
 
 static TASK_LOCALS: OnceLock<TaskLocals> = OnceLock::new();
@@ -58,6 +59,7 @@ fn get_task_locals() -> &'static TaskLocals {
 pub struct OmniEngine {
     engine: PyObject,
     pub model_name: String,
+    tokenizer: Option<Tokenizer>,
 }
 
 unsafe impl Send for OmniEngine {}
@@ -91,9 +93,17 @@ impl OmniEngine {
             )?;
 
             info!("AsyncOmni ready");
+
+            let tokenizer = Tokenizer::from_pretrained(model, None)
+                .map_err(|e| {
+                    info!("Could not load tokenizer from HF: {e}. Prompt length estimation will use fallback.");
+                })
+                .ok();
+
             Ok(Self {
                 engine: engine.into(),
                 model_name: model.to_string(),
+                tokenizer,
             })
         })
     }
@@ -139,6 +149,44 @@ impl OmniEngine {
                 }
             }),
         }
+    }
+
+    /// Estimate the placeholder prompt length for Qwen3-TTS CustomVoice.
+    ///
+    /// Mirrors `Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information`.
+    pub fn estimate_tts_prompt_len(
+        &self,
+        text: &str,
+        instruct: Option<&str>,
+    ) -> usize {
+        let Some(ref tokenizer) = self.tokenizer else {
+            return 2048;
+        };
+
+        let tokenize = |s: &str| -> usize {
+            tokenizer
+                .encode(s, false)
+                .map(|enc| enc.get_ids().len())
+                .unwrap_or(0)
+        };
+
+        let instruct_len = match instruct {
+            Some(i) if !i.trim().is_empty() => {
+                tokenize(&format!("<|im_start|>user\n{i}<|im_end|>\n"))
+            }
+            _ => 0,
+        };
+
+        let assistant_text = format!(
+            "<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+        );
+        let assistant_len = tokenize(&assistant_text);
+
+        let role_len = 3;
+        let codec_prefix_len = 5; // (prefill=3 + speaker=1 + 2) - 1
+
+        // CustomVoice non_streaming_mode=True: full text ids + eos + codec_bos
+        instruct_len + role_len + codec_prefix_len + assistant_len.saturating_sub(6)
     }
 
     pub fn shutdown(&self) -> Result<()> {

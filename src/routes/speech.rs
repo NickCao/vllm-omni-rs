@@ -277,34 +277,83 @@ async fn create_speech_raw_stream(
     (headers, body).into_response()
 }
 
-/// Build the prompt dict and call engine.generate().
+/// Build the Qwen3-TTS prompt and call engine.generate().
+///
+/// The prompt format is:
+///   prompt_token_ids: [1] * estimated_len  (placeholders)
+///   additional_information: {text, task_type, language, speaker, ...}
 fn start_generate(
     py: Python<'_>,
     engine: &OmniEngine,
     req: &SpeechRequest,
     request_id: &str,
 ) -> anyhow::Result<PyObject> {
-    let prompt = PyDict::new(py);
-    prompt.set_item("prompt", &req.input)?;
+    let additional_info = PyDict::new(py);
+    additional_info.set_item(
+        "text",
+        pyo3::types::PyList::new(py, &[&req.input])?,
+    )?;
 
-    if let Some(ref voice) = req.voice {
-        prompt.set_item("speaker", voice)?;
-    }
+    let task_type = req
+        .extra
+        .get("task_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("CustomVoice");
+    additional_info.set_item(
+        "task_type",
+        pyo3::types::PyList::new(py, &[task_type])?,
+    )?;
+
+    let language = req
+        .extra
+        .get("language")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Auto");
+    additional_info.set_item(
+        "language",
+        pyo3::types::PyList::new(py, &[language])?,
+    )?;
+
+    let speaker = req.voice.as_deref().unwrap_or("Chelsie");
+    additional_info.set_item(
+        "speaker",
+        pyo3::types::PyList::new(py, &[speaker])?,
+    )?;
+
     if let Some(ref instructions) = req.instructions {
-        prompt.set_item("instruct", instructions)?;
+        additional_info.set_item(
+            "instruct",
+            pyo3::types::PyList::new(py, &[instructions.as_str()])?,
+        )?;
     }
 
-    // Pass extra fields from the request into the prompt.
+    // Pass any extra fields into additional_information.
     for (k, v) in &req.extra {
+        if matches!(k.as_str(), "task_type" | "language") {
+            continue;
+        }
         let py_v = pythonize::pythonize(py, v)?;
-        prompt.set_item(k, py_v)?;
+        additional_info.set_item(k, py_v)?;
     }
+
+    // Build prompt with placeholder token IDs.
+    // The model replaces these with computed embeddings at forward time.
+    let placeholder_len = engine.estimate_tts_prompt_len(
+        &req.input,
+        req.instructions.as_deref(),
+    );
+    let ones: Vec<i64> = vec![1; placeholder_len];
+    let prompt_token_ids = pyo3::types::PyList::new(py, &ones)?;
+
+    let prompt = PyDict::new(py);
+    prompt.set_item("prompt_token_ids", prompt_token_ids)?;
+    prompt.set_item("additional_information", additional_info)?;
 
     let kwargs = PyDict::new(py);
     kwargs.set_item("request_id", request_id)?;
     kwargs.set_item(
         "output_modalities",
-        pyo3::types::PyList::new(py, &["audio"])?,
+        pyo3::types::PyList::new(py, &[&"audio"])?,
     )?;
 
     engine.generate(py, &prompt, &kwargs)
