@@ -21,6 +21,19 @@ use tracing::{error, info};
 use crate::engine::OmniEngine;
 use crate::server::{AppState, build_router};
 
+struct ProcessGroupGuard;
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            // Kill our entire process group (us + all Python children).
+            // Negative PID = process group.
+            libc::kill(0, libc::SIGTERM);
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "vllm-omni-rs", about = "Rust HTTP frontend for vllm-omni")]
 struct Cli {
@@ -56,6 +69,13 @@ fn main() -> Result<()> {
         cli.model, cli.host, cli.port
     );
 
+    // Put this process into its own process group so all Python children
+    // (StageEngineCoreProc) share our PGID and can be killed together.
+    #[cfg(unix)]
+    unsafe {
+        libc::setpgid(0, 0);
+    }
+
     pyo3::prepare_freethreaded_python();
     engine::init_python_event_loop().context("Failed to init Python event loop")?;
 
@@ -69,6 +89,9 @@ fn main() -> Result<()> {
 
     let engine =
         Arc::new(OmniEngine::new(&cli.model, &extra_kwargs).context("Failed to create engine")?);
+
+    // Ensure all Python children are killed if this process exits for any reason.
+    let _pg_guard = ProcessGroupGuard;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(std::cmp::min(num_cpus::get(), 32))
