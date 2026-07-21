@@ -230,78 +230,96 @@ pub fn extract_audio(
 ) -> Option<(Vec<u8>, u32)> {
     let obj = output.bind(py);
 
+    // Mirrors Python's OmniOpenAIServingSpeech._extract_audio_output
+    // then _generate_audio_bytes audio extraction logic.
+    let obj = output.bind(py);
     let mm = obj.getattr("multimodal_output").ok()?;
-    if mm.is_none() || !mm.is_truthy().unwrap_or(false) {
+    if mm.is_none() {
         return None;
     }
 
-    // Find the audio tensor -- try "audio" first, then "model_outputs"
-    let audio_key = if mm.contains("audio").unwrap_or(false) {
-        "audio"
-    } else if mm.contains("model_outputs").unwrap_or(false) {
-        "model_outputs"
-    } else {
-        return None;
-    };
+    // Find audio key: "audio" first, then "model_outputs"
+    let audio_key = ["audio", "model_outputs"]
+        .into_iter()
+        .find(|k| mm.contains(k).unwrap_or(false))?;
 
     let audio_val = mm.get_item(audio_key).ok()?;
 
-    // Audio value may be a single tensor or a list of tensors
+    // For non-async Qwen3-TTS: audio_val is a list of cumulative
+    // snapshot tensors. Take the last non-empty one.
     let tensor = if let Ok(list) =
         audio_val.downcast::<pyo3::types::PyList>()
     {
-        if list.is_empty() {
+        let mut best = None;
+        for i in (0..list.len()).rev() {
+            if let Ok(item) = list.get_item(i) {
+                let n: i64 = item
+                    .call_method0("numel")
+                    .and_then(|v| v.extract())
+                    .unwrap_or(0);
+                if n > 0 {
+                    best = Some(item);
+                    break;
+                }
+            }
+        }
+        best?
+    } else {
+        let n: i64 = audio_val
+            .call_method0("numel")
+            .and_then(|v| v.extract())
+            .unwrap_or(0);
+        if n == 0 {
             return None;
         }
-        list.get_item(0).ok()?
-    } else {
         audio_val
     };
 
-    // Skip empty tensors
-    let numel: i64 = tensor
-        .call_method0("numel")
-        .and_then(|v| v.extract())
-        .unwrap_or(0);
-    if numel == 0 {
-        return None;
-    }
-
-    // Get sample rate -- may be in "sr" as int, list, or tensor
+    // Sample rate: mm["sr"], may be int, list[int], or list[tensor]
     let sr: u32 = (|| -> Option<u32> {
         let sr_val = mm.get_item("sr").ok()?;
         if let Ok(v) = sr_val.extract::<u32>() {
             return Some(v);
         }
         if let Ok(list) = sr_val.downcast::<pyo3::types::PyList>() {
-            if let Ok(item) = list.get_item(0) {
-                if let Ok(v) = item.extract::<u32>() {
-                    return Some(v);
-                }
-                // Could be a tensor scalar
-                if let Ok(v) = item.call_method0("item") {
-                    return v.extract::<u32>().ok();
-                }
+            let last = list.get_item(list.len().checked_sub(1)?).ok()?;
+            if let Ok(v) = last.extract::<u32>() {
+                return Some(v);
             }
+            return last
+                .call_method0("item")
+                .ok()?
+                .extract::<u32>()
+                .ok();
         }
         None
     })()
     .unwrap_or(24000);
 
-    // Convert tensor to float32 numpy bytes
+    // tensor.float().detach().cpu().numpy() -- matches Python path
     let np_array = tensor
+        .call_method0("float")
+        .ok()?
         .call_method0("detach")
         .ok()?
         .call_method0("cpu")
         .ok()?
-        .call_method0("float")
-        .ok()?
-        .call_method0("squeeze")
-        .ok()?
         .call_method0("numpy")
         .ok()?;
+
+    // Squeeze to 1D if needed (matches Python: if ndim > 1: squeeze())
+    let ndim: i64 = np_array
+        .getattr("ndim")
+        .and_then(|v| v.extract())
+        .unwrap_or(1);
+    let final_array = if ndim > 1 {
+        np_array.call_method0("squeeze").ok()?
+    } else {
+        np_array
+    };
+
     let raw_bytes: Vec<u8> =
-        np_array.call_method0("tobytes").ok()?.extract().ok()?;
+        final_array.call_method0("tobytes").ok()?.extract().ok()?;
 
     if raw_bytes.is_empty() {
         return None;
