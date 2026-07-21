@@ -68,6 +68,27 @@ pub async fn create_speech(
     Json(req): Json<SpeechRequest>,
 ) -> Response {
     let request_id = format!("speech-{}", Uuid::new_v4());
+
+    if let Some(ref voice) = req.voice {
+        if !state.engine.supported_speakers.is_empty() {
+            let voice_lower = voice.to_lowercase();
+            if !state
+                .engine
+                .supported_speakers
+                .iter()
+                .any(|s| s.to_lowercase() == voice_lower)
+            {
+                let valid = state.engine.supported_speakers.join(", ");
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "Invalid voice '{voice}'. Supported: {valid}"
+                    ),
+                );
+            }
+        }
+    }
+
     let is_sse = req.stream || req.stream_format.as_deref() == Some("sse");
     let is_raw_stream = req.stream_format.as_deref() == Some("audio");
 

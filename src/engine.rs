@@ -60,6 +60,7 @@ pub struct OmniEngine {
     engine: PyObject,
     pub model_name: String,
     tokenizer: Option<Tokenizer>,
+    pub supported_speakers: Vec<String>,
 }
 
 unsafe impl Send for OmniEngine {}
@@ -100,10 +101,29 @@ impl OmniEngine {
                 })
                 .ok();
 
+            let supported_speakers = (|| -> PyResult<Vec<String>> {
+                let hf_config = engine.getattr("model_config")?.getattr("hf_config")?;
+                let talker_config = hf_config.getattr("talker_config")?;
+                let spk_id = talker_config.getattr("spk_id")?;
+                let dict = spk_id.downcast::<PyDict>()?;
+                let speakers: Vec<String> = dict
+                    .keys()
+                    .iter()
+                    .filter_map(|k| k.extract::<String>().ok())
+                    .collect();
+                Ok(speakers)
+            })()
+            .unwrap_or_default();
+
+            if !supported_speakers.is_empty() {
+                info!("Supported speakers: {}", supported_speakers.join(", "));
+            }
+
             Ok(Self {
                 engine: engine.into(),
                 model_name: model.to_string(),
                 tokenizer,
+                supported_speakers,
             })
         })
     }
