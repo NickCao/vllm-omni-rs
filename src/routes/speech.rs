@@ -89,8 +89,7 @@ pub async fn create_speech(
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to serialize: {e}")),
     };
 
-    // Estimate prompt length (placeholder for now -- will use tokenizer)
-    let prompt_len = 2048usize; // TODO: use vllm-tokenizer
+    let prompt_len = state.router.estimate_prompt_len(&req.input, req.instructions.as_deref());
     let prompt_token_ids: Vec<u32> = vec![1; prompt_len];
 
     match state.router.generate_speech(

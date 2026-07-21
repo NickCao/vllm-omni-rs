@@ -3,6 +3,7 @@
 //! Workers handle inter-stage data transfer via SharedMemoryConnector.
 //! This router only manages request lifecycle and prompt construction.
 
+use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -12,16 +13,18 @@ use vllm_engine_core_client::EngineCoreClient;
 use vllm_engine_core_client::protocol::OpaqueValue;
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
+use vllm_tokenizer::{HuggingFaceTokenizer, Tokenizer};
 
 use crate::master::ConnectedStage;
 
 pub struct TtsRouter {
     pub stage0: EngineCoreClient,
     pub stage1: EngineCoreClient,
+    tokenizer: Option<HuggingFaceTokenizer>,
 }
 
 impl TtsRouter {
-    pub fn new(stages: Vec<ConnectedStage>) -> Result<Self> {
+    pub fn new(stages: Vec<ConnectedStage>, tokenizer_path: Option<&str>) -> Result<Self> {
         if stages.len() != 2 {
             bail!(
                 "TTS routing requires exactly 2 stages, got {}",
@@ -37,9 +40,16 @@ impl TtsRouter {
                 id => bail!("Unexpected stage_id: {id}"),
             }
         }
+        let tokenizer_path = tokenizer_path
+            .context("--tokenizer-path is required")?;
+        let tokenizer = HuggingFaceTokenizer::new(Path::new(tokenizer_path))
+            .context(format!("Failed to load tokenizer from {tokenizer_path}"))?;
+        info!("Tokenizer loaded from {tokenizer_path}");
+
         Ok(Self {
             stage0: s0.context("Stage 0 not found")?,
             stage1: s1.context("Stage 1 not found")?,
+            tokenizer: Some(tokenizer),
         })
     }
 
@@ -158,9 +168,24 @@ impl TtsRouter {
         Ok(audio_output)
     }
 
+    pub fn estimate_prompt_len(&self, text: &str, instruct: Option<&str>) -> usize {
+        let Some(ref tok) = self.tokenizer else { return 2048; };
+        let tokenize = |s: &str| -> usize {
+            tok.encode(s, false).map(|ids| ids.len()).unwrap_or(0)
+        };
+        let instruct_len = match instruct {
+            Some(i) if !i.trim().is_empty() =>
+                tokenize(&format!("<|im_start|>user\n{i}<|im_end|>\n")),
+            _ => 0,
+        };
+        let assistant_len = tokenize(
+            &format!("<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n")
+        );
+        // CustomVoice non_streaming_mode=True
+        instruct_len + 3 + 5 + assistant_len.saturating_sub(6)
+    }
+
     pub fn shutdown(self) -> Result<()> {
-        // EngineCoreClient::shutdown is async, but we need sync here
-        // The clients will be dropped which closes the ZMQ sockets
         tokio::spawn(async move {
             let _ = self.stage0.shutdown().await;
             let _ = self.stage1.shutdown().await;

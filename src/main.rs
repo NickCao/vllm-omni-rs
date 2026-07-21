@@ -34,6 +34,41 @@ use crate::master::start_and_connect_stages;
 use crate::routing::TtsRouter;
 use crate::stages::{StageSpawnConfig, shutdown_stages, spawn_stages};
 
+/// Extract tokenizer.json from the model using a one-time Python call.
+/// The HF repo doesn't ship tokenizer.json but the Python tokenizer
+/// builds one from vocab.json + merges.txt.
+fn extract_tokenizer(model: &str) -> Option<String> {
+    let path = format!("/tmp/_vllm_omni_rs_tokenizer_{}.json", model.replace('/', "_"));
+    if std::path::Path::new(&path).exists() {
+        info!("Using cached tokenizer: {path}");
+        return Some(path);
+    }
+    let script = format!(
+        "from transformers import AutoTokenizer; \
+         t = AutoTokenizer.from_pretrained('{}', trust_remote_code=True); \
+         t.backend_tokenizer.save('{}')",
+        model, path
+    );
+    match std::process::Command::new("python3")
+        .args(["-c", &script])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            info!("Extracted tokenizer to {path}");
+            Some(path)
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!("Failed to extract tokenizer: {stderr}");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("Failed to run python3 for tokenizer: {e}");
+            None
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "vllm-omni-rs",
@@ -58,6 +93,10 @@ struct Cli {
     /// Timeout for engine handshake in seconds.
     #[arg(long, default_value_t = 300)]
     handshake_timeout: u64,
+
+    /// Path to tokenizer.json for prompt length estimation.
+    #[arg(long)]
+    tokenizer_path: Option<String>,
 
     /// Extra CLI args passed to headless Python stages.
     #[arg(long, num_args = 1..)]
@@ -122,8 +161,11 @@ fn main() -> Result<()> {
         );
 
         // 4. Create TTS router
-        let router = Arc::new(TtsRouter::new(connected_stages)
-            .context("Failed to create TTS router")?);
+        let router = Arc::new(TtsRouter::new(
+            connected_stages,
+            cli.tokenizer_path.as_deref(),
+        ).context("Failed to create TTS router")?);
+
 
         // 5. Start HTTP server
         let state = server::AppState {
