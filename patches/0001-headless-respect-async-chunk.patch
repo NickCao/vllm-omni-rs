@@ -1,0 +1,29 @@
+# Required patch for vllm-omni-rs: run_headless() hardcodes async_chunk=False
+# when building the stage connector spec, which makes get_stage_connector_spec
+# return {} unconditionally -- headless mode never gets a real connector, so
+# stage 0 and stage 1 never exchange codec data over SharedMemoryConnector.
+# --async-chunk is already a real vLLM EngineArgs flag; run_headless just
+# never read it. This makes it do so, matching what the normal orchestrated
+# `vllm serve --omni` path does.
+#
+# Base commit: ae083d1823c9efd4bed85b41d6ea4fcacd242f98
+# Apply from the vllm-omni repo root with:
+#   git apply /path/to/vllm-omni-rs/patches/0001-headless-respect-async-chunk.patch
+diff --git a/vllm_omni/entrypoints/cli/serve.py b/vllm_omni/entrypoints/cli/serve.py
+index 5d435bc2..ce99860d 100644
+--- a/vllm_omni/entrypoints/cli/serve.py
++++ b/vllm_omni/entrypoints/cli/serve.py
+@@ -859,10 +859,12 @@ def run_headless(args: TrackingNamespace) -> None:
+ 
+     omni_transfer_config = load_omni_transfer_config_for_model(model, config_path)
+     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
++    async_chunk = getattr(args, "async_chunk", None)
++    async_chunk = True if async_chunk is None else bool(async_chunk)
+     stage_connector_spec = get_stage_connector_spec(
+         omni_transfer_config=omni_transfer_config,
+         stage_id=stage_id,
+-        async_chunk=False,
++        async_chunk=async_chunk,
+     )
+ 
+     # ``runtime_cfg`` is mostly inherited from the parent's
