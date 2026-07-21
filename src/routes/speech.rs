@@ -276,24 +276,24 @@ fn estimate_prompt_len_py(
     locals.set_item("task_type", task_type)?;
     locals.set_item("engine", engine.engine_ref(py))?;
 
-    let code = CString::new(r#"
-import sys
-from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import Qwen3TTSPromptEmbedsBuilder
-
-_cache = sys.modules.setdefault('_omni_rs_cache', type(sys)('_omni_rs_cache'))
-if not hasattr(_cache, 'tok'):
-    from transformers import AutoTokenizer
-    _cache.tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side='left')
-
-talker_config = engine.model_config.hf_config.talker_config
-result = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
-    additional_information=dict(info),
-    task_type=task_type,
-    tokenize_prompt=lambda t: _cache.tok(t, padding=False)['input_ids'],
-    codec_language_id=getattr(talker_config, 'codec_language_id', None),
-    spk_is_dialect=getattr(talker_config, 'spk_is_dialect', None),
-)
-"#).unwrap();
+    let code = CString::new(concat!(
+        "import sys, types\n",
+        "from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import Qwen3TTSPromptEmbedsBuilder\n",
+        "if '_omni_rs_cache' not in sys.modules:\n",
+        "    from transformers import AutoTokenizer\n",
+        "    _m = types.ModuleType('_omni_rs_cache')\n",
+        "    _m.tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side='left')\n",
+        "    sys.modules['_omni_rs_cache'] = _m\n",
+        "_tok = sys.modules['_omni_rs_cache'].tok\n",
+        "talker_config = engine.model_config.hf_config.talker_config\n",
+        "result = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(\n",
+        "    additional_information=dict(info),\n",
+        "    task_type=task_type,\n",
+        "    tokenize_prompt=lambda t: _tok(t, padding=False)['input_ids'],\n",
+        "    codec_language_id=getattr(talker_config, 'codec_language_id', None),\n",
+        "    spk_is_dialect=getattr(talker_config, 'spk_is_dialect', None),\n",
+        ")\n",
+    )).unwrap();
     py.run(&code, None, Some(&locals))?;
 
     locals.get_item("result")?.unwrap().extract()
