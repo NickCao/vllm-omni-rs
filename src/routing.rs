@@ -60,7 +60,7 @@ impl TtsRouter {
         prompt_token_ids: Vec<u32>,
         additional_info: OpaqueValue,
         _sampling_params: Option<EngineCoreSamplingParams>,
-    ) -> Result<Option<OpaqueValue>> {
+    ) -> Result<Vec<OpaqueValue>> {
         let start = Instant::now();
 
         // Submit stage 0 (talker)
@@ -109,25 +109,23 @@ impl TtsRouter {
         let stage0_ms = start.elapsed().as_millis();
         info!("[{request_id}] Stage 0 done: {token_count} tokens, {stage0_ms}ms");
 
-        // Wait for connector save_loop to process remaining chunks.
-        // Stage 0's background thread needs time to write all codec
-        // chunks to /dev/shm before stage 1 tries to read them.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // Collect stage 1 output (audio)
-        let mut audio_output: Option<OpaqueValue> = None;
+        // Collect stage 1 output (audio). Stage 1 uses DELTA output_kind,
+        // so each multimodal_output is a NEW chunk of audio, not the full
+        // buffer -- these must be accumulated, not overwritten, matching
+        // the Python frontend's torch.cat over all streamed chunks.
+        let mut audio_chunks: Vec<OpaqueValue> = Vec::new();
         while let Some(result) = stream1.next().await {
             let output = result.context("Stage 1 stream error")?;
-            if output.multimodal_output.is_some() {
-                audio_output = output.multimodal_output.clone();
+            if let Some(mm) = output.multimodal_output.clone() {
+                audio_chunks.push(mm);
             }
             if output.finished() { break; }
         }
 
         let total_ms = start.elapsed().as_millis();
-        info!("[{request_id}] Done: {total_ms}ms, has_audio={}", audio_output.is_some());
+        info!("[{request_id}] Done: {total_ms}ms, chunks={}", audio_chunks.len());
 
-        Ok(audio_output)
+        Ok(audio_chunks)
     }
 
     pub fn estimate_prompt_len(&self, text: &str, instruct: Option<&str>) -> usize {

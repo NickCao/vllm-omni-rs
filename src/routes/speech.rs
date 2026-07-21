@@ -91,9 +91,9 @@ pub async fn create_speech(
         additional_info,
         None,
     ).await {
-        Ok(Some(audio_opaque)) => {
-            debug!("Audio OpaqueValue: {:?}", audio_opaque);
-                match extract_audio_from_opaque(&audio_opaque, &response_format) {
+        Ok(chunks) if !chunks.is_empty() => {
+            debug!("Received {} audio chunks", chunks.len());
+            match extract_and_concat_audio(&chunks, &response_format) {
                 Ok((audio_bytes, content_type)) => {
                     let mut headers = HeaderMap::new();
                     headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
@@ -102,7 +102,7 @@ pub async fn create_speech(
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Audio extraction: {e:#}")),
             }
         }
-        Ok(None) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "No audio output"),
+        Ok(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "No audio output"),
         Err(e) => {
             error!("[{request_id}] Generate failed: {e:#}");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}"))
@@ -110,27 +110,23 @@ pub async fn create_speech(
     }
 }
 
-/// Extract audio PCM bytes from the multimodal_output OpaqueValue.
-///
-/// The wire format for tensors is (dtype_str, shape_tuple, raw_data).
-/// For MultimodalPayload, it's a map with "audio" and "sr" tensor entries.
-/// The raw_data may be inline bytes or a msgpack Ext type.
-fn extract_audio_from_opaque(value: &OpaqueValue, response_format: &str) -> Result<(Vec<u8>, &'static str)> {
-    let val = value;
-    debug!("multimodal_output type: {:?}", val);
-
-    // Navigate the structure to find audio tensor data.
-    // MultimodalPayload serializes as a map with "tensors" and "metadata" keys,
-    // where tensors contains {"audio": (dtype, shape, data), "sr": (dtype, shape, data)}.
-    // Or it may be a flat map {"audio": tensor, "sr": tensor}.
-    let audio_tensor = find_tensor_in_value(val, "audio")
-        .or_else(|| find_tensor_in_value(val, "model_outputs"))
-        .ok_or_else(|| anyhow::anyhow!("No audio tensor found in multimodal output"))?;
-    let sr = find_scalar_in_value(val, "sr").unwrap_or(24000);
-
-    // audio_tensor is (dtype_str, shape, raw_bytes)
-    let pcm_f32_bytes = decode_tensor_bytes(&audio_tensor)?;
-
+/// Extract PCM bytes from each chunk (DELTA output_kind -- each chunk is a
+/// new audio slice) and concatenate them in order, matching the Python
+/// frontend's `torch.cat` over all streamed audio deltas.
+fn extract_and_concat_audio(chunks: &[OpaqueValue], response_format: &str) -> Result<(Vec<u8>, &'static str)> {
+    let mut sr = 24000u32;
+    let mut pcm_f32_bytes: Vec<u8> = Vec::new();
+    for chunk in chunks {
+        let Some(audio_tensor) = find_tensor_in_value(chunk, "audio")
+            .or_else(|| find_tensor_in_value(chunk, "model_outputs")) else { continue };
+        if let Some(found_sr) = find_scalar_in_value(chunk, "sr") {
+            sr = found_sr;
+        }
+        pcm_f32_bytes.extend(decode_tensor_bytes(&audio_tensor)?);
+    }
+    if pcm_f32_bytes.is_empty() {
+        anyhow::bail!("No audio tensor found in any multimodal output chunk");
+    }
     encode_audio(&pcm_f32_bytes, sr, response_format)
 }
 
