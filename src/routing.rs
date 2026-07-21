@@ -105,8 +105,12 @@ impl TtsRouter {
 
         let stage0_ms = start.elapsed().as_millis();
         info!(
-            "[{request_id}] Stage 0 done: {token_count} tokens, {stage0_ms}ms"
+            "[{request_id}] Stage 0 done: {token_count} tokens, {stage0_ms}ms, has_mm={}",
+            stage0_mm.is_some()
         );
+        if let Some(ref mm) = stage0_mm {
+            debug!("[{request_id}] Stage 0 multimodal_output: {mm:?}");
+        }
 
         // === Bridge: build stage 1 prompt ===
         // Stage 1 needs prompt_token_ids with the right length
