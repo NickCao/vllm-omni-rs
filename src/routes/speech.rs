@@ -123,45 +123,15 @@ async fn create_speech_full(
     };
 
     let mut last_audio: Option<(Vec<u8>, u32)> = None;
-    let mut yield_count = 0u32;
 
     loop {
         match OmniEngine::anext(&generator).await {
             Ok(Some(output)) => {
-                yield_count += 1;
-                let (audio, finished, debug_info) =
-                    Python::with_gil(|py| {
-                        let obj = output.bind(py);
-                        let out_type: String = obj
-                            .getattr("final_output_type")
-                            .and_then(|v| v.extract())
-                            .unwrap_or_default();
-                        let mm = obj
-                            .getattr("multimodal_output")
-                            .ok();
-                        let has_mm = mm
-                            .as_ref()
-                            .map(|v| !v.is_none() && v.is_truthy().unwrap_or(false))
-                            .unwrap_or(false);
-                        let mm_repr: String = mm
-                            .as_ref()
-                            .map(|v| format!("{}", v.repr().map(|r| r.to_string()).unwrap_or_default()))
-                            .unwrap_or_default();
-                        let has_req = obj
-                            .getattr("request_output")
-                            .map(|v| !v.is_none())
-                            .unwrap_or(false);
-                        let fin = is_finished(py, &output);
-                        let audio = extract_audio(py, &output);
-                        let debug = format!(
-                            "yield#{yield_count}: type={out_type} finished={fin} \
-                             has_mm={has_mm} mm={mm_repr} \
-                             has_req_output={has_req} audio_extracted={}",
-                            audio.is_some()
-                        );
-                        (audio, fin, debug)
-                    });
-                tracing::info!("{debug_info}");
+                let (audio, finished) = Python::with_gil(|py| {
+                    let audio = extract_audio(py, &output);
+                    let fin = is_finished(py, &output);
+                    (audio, fin)
+                });
                 if audio.is_some() {
                     last_audio = audio;
                 }
@@ -399,12 +369,32 @@ fn start_generate(
     prompt.set_item("prompt_token_ids", prompt_token_ids)?;
     prompt.set_item("additional_information", additional_info)?;
 
+    // Get default sampling params and coerce to FINAL_ONLY for non-streaming.
+    // This matches Python's coerce_param_message_types(spl, is_streaming=False)
+    // which sets output_kind=FINAL_ONLY so the engine yields the complete
+    // waveform instead of incremental deltas.
+    let is_streaming = req.stream || req.stream_format.as_deref() == Some("sse");
+    let spl_list = (|| -> PyResult<Bound<'_, pyo3::types::PyList>> {
+        let utils = py.import("vllm_omni.entrypoints.utils")?;
+        let engine_obj = engine.engine_ref(py);
+        let default_spl = engine_obj.getattr("default_sampling_params_list")?;
+        let spl_copy = py.import("copy")?.call_method1("deepcopy", (&default_spl,))?;
+        let spl_list = spl_copy.downcast_into::<pyo3::types::PyList>()?;
+        utils.call_method1(
+            "coerce_param_message_types",
+            (&spl_list, is_streaming),
+        )?;
+        Ok(spl_list)
+    })()
+    .map_err(|e| anyhow::anyhow!("Failed to prepare sampling params: {e}"))?;
+
     let kwargs = PyDict::new(py);
     kwargs.set_item("request_id", request_id)?;
     kwargs.set_item(
         "output_modalities",
         pyo3::types::PyList::new(py, &[&"audio"])?,
     )?;
+    kwargs.set_item("sampling_params_list", spl_list)?;
 
     engine.generate(py, &prompt, &kwargs)
 }

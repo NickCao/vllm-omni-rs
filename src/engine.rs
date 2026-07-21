@@ -128,6 +128,10 @@ impl OmniEngine {
         })
     }
 
+    pub fn engine_ref<'py>(&self, py: Python<'py>) -> &Bound<'py, PyAny> {
+        self.engine.bind(py)
+    }
+
     pub fn generate(
         &self,
         py: Python<'_>,
@@ -228,7 +232,7 @@ pub fn extract_audio(
     py: Python<'_>,
     output: &PyObject,
 ) -> Option<(Vec<u8>, u32)> {
-    let obj = output.bind(py);
+    let _obj = output.bind(py);
 
     // Mirrors Python's OmniOpenAIServingSpeech._extract_audio_output
     // then _generate_audio_bytes audio extraction logic.
