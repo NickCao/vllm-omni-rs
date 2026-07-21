@@ -403,15 +403,8 @@ pub(crate) async fn run_output_dispatcher_loop(
                         drop(inner.finish_requests(finished_requests));
                     }
 
-                    if let Some(scheduler_stats) = batch.scheduler_stats.as_ref() {
-                        if !inner.apply_scheduler_stats(batch.engine_index, scheduler_stats) {
-                            debug!(
-                                engine_index = batch.engine_index,
-                                "dropping scheduler stats for unknown engine"
-                            );
-                        }
-                        inner.scheduler_stats_recorder.record(batch.engine_index, scheduler_stats);
-                    }
+                    // Scheduler stats recording skipped (OpaqueValue for omni compat)
+                    let _ = &batch.scheduler_stats;
 
                     // The engine's scheduler stats never carry adapter names;
                     // the gauge is derived from the registry's frontend-side

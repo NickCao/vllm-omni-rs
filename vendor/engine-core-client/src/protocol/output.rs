@@ -156,7 +156,7 @@ struct WireEngineCoreOutputs {
     #[serde(default)]
     outputs: Vec<EngineCoreOutput>,
     #[serde(default)]
-    scheduler_stats: Option<Box<SchedulerStats>>,
+    scheduler_stats: Option<OpaqueValue>,
     #[serde(default)]
     timestamp: f64,
     #[serde(default)]
@@ -184,7 +184,7 @@ pub enum DpControlMessage {
 pub struct RequestBatchOutputs {
     pub engine_index: u32,
     pub outputs: Vec<EngineCoreOutput>,
-    pub scheduler_stats: Option<Box<SchedulerStats>>,
+    pub scheduler_stats: Option<OpaqueValue>,
     pub timestamp: f64,
     pub finished_requests: Option<BTreeSet<String>>,
 }
