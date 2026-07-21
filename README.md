@@ -101,36 +101,45 @@ thing that has to change to make headless mode support it.
    in Rust, using a native tokenizer (see [Tokenizer](#tokenizer)) instead
    of round-tripping into Python. Build a placeholder prompt of that many
    token ids.
-3. Submit both stages **concurrently**, matching what vllm-omni's Python
-   orchestrator does in `_prewarm_async_chunk_stages`:
-   - Stage 0 (talker) gets the real placeholder prompt, the
-     `additional_information`, and its sampling params.
-   - Stage 1 (code2wav) gets a 1-token placeholder prompt, the *same*
-     `additional_information`, `resumable=true` (marks it as a streaming
-     input the connector will keep extending), and its sampling params.
-   - Both requests share the same `request_id`/`external_req_id` -- that's
-     what lets the connector match stage 0's output to stage 1's input.
+3. Submit **every stage in the pipeline concurrently**, matching what
+   vllm-omni's Python orchestrator does in `_prewarm_async_chunk_stages`
+   for N stages, not just 2:
+   - **Root stages** (no upstream source, e.g. the talker) get the real
+     placeholder prompt and `additional_information`.
+   - **Downstream stages** (fed by an earlier stage via the connector,
+     e.g. code2wav) get a 1-token placeholder prompt, the *same*
+     `additional_information`, and `resumable=true` (marks the request as
+     a streaming input the connector will keep extending).
+   - All requests for one HTTP call share the same
+     `request_id`/`external_req_id` -- that's what lets the connector
+     match each stage's output to the next stage's input.
+   - Which stage is root vs downstream isn't hardcoded: `TtsRouter` reads
+     each stage's `engine_input_source` from the introspected pipeline
+     topology (empty = root). Every async_chunk pipeline checked so far is
+     a linear chain (at most one upstream source per stage) -- Qwen3-TTS's
+     2-stage talker/code2wav, and also Qwen3-Omni's 3-stage
+     thinker -> talker -> code2wav.
    - Per-stage sampling params (`temperature`, `top_p`, `top_k`,
      `repetition_penalty`, `max_tokens`, `min_tokens`, `stop_token_ids`,
-     `detokenize`) are *not* hardcoded. `introspect.rs` shells out to Python
-     once at startup and calls the exact same
+     `detokenize`) are *not* hardcoded either. `introspect.rs` shells out
+     to Python once at startup and calls the exact same
      `load_and_resolve_stage_configs` function `run_headless()` itself uses,
      which merges the deploy YAML's `default_sampling_params` with the
      pipeline topology's `sampling_constraints` (e.g. the talker's
      `stop_token_ids: [2150]`). `TtsRouter` builds each stage's
-     `EngineCoreSamplingParams` from that at startup; the only thing it adds
-     on top is `output_kind` (`FINAL_ONLY` for stage 0, `DELTA` for stage
-     1), since that's about how *this frontend* consumes the stream, not a
-     model property.
+     `EngineCoreSamplingParams` from that at startup; the only thing it
+     adds on top is `output_kind` (`DELTA` for the audio-output stage,
+     `FINAL_ONLY` for every other stage), since that's about how *this
+     frontend* consumes the stream, not a model property.
 4. From here on, **Rust does not move any codec data**. Each headless
    stage's own worker process runs vllm-omni's `OmniChunkTransferAdapter` /
-   `SharedMemoryConnector`, which writes stage 0's codec chunks to
-   `/dev/shm` and stage 1's scheduler polls them out as they arrive. This
-   is exactly the same mechanism the orchestrated Python path uses.
-5. Rust drains stage 0's output stream until it reports finished (only
-   used for token-count logging).
-6. Rust drains stage 1's output stream, collecting every
-   `multimodal_output` chunk. Stage 1 uses `output_kind=DELTA`, so **each
+   `SharedMemoryConnector`, which writes a stage's codec chunks to
+   `/dev/shm` and the next stage's scheduler polls them out as they arrive.
+   This is exactly the same mechanism the orchestrated Python path uses.
+5. Rust drains every non-audio stage's output stream to completion, in
+   stage-id order (only used for token-count logging).
+6. Rust drains the audio stage's output stream last, collecting every
+   `multimodal_output` chunk. It uses `output_kind=DELTA`, so **each
    chunk is a new slice of audio, not the cumulative buffer** -- these are
    concatenated in order, mirroring the Python frontend's `torch.cat` over
    all streamed audio deltas. (Overwriting instead of accumulating here
@@ -294,12 +303,16 @@ print(model.transcribe(audio, fp16=False)['text'])
 
 ## Known limitations
 
-- Hardcoded to a 2-stage Talker -> Code2Wav pipeline (Qwen3-TTS shape).
-  Per-stage *sampling params* are introspected from vllm-omni at startup
-  (see [Request lifecycle](#request-lifecycle-post-v1audiospeech)), so those
-  would already be correct for another 2-stage async_chunk talker/vocoder
-  model (CosyVoice3, Higgs-Audio v2/v3, GLM-TTS, Fish-Speech all use the
-  same pattern). What's still Qwen3-TTS-specific and would need porting:
+- `TtsRouter` is topology-driven, not hardcoded to 2 stages: it introspects
+  stage count, roles (root vs connector-fed), and per-stage sampling
+  params from vllm-omni's own `load_and_resolve_stage_configs` at startup
+  (see [Request lifecycle](#request-lifecycle-post-v1audiospeech)). This
+  covers every async_chunk pipeline checked so far, including 2-stage
+  talker/vocoder models (CosyVoice3, Higgs-Audio v2/v3, GLM-TTS,
+  Fish-Speech) and Qwen3-Omni's 3-stage thinker -> talker -> code2wav
+  chain -- verified end to end only against Qwen3-TTS, though; the 3+-stage
+  path is exercised by the topology data, not a live test. What's still
+  Qwen3-TTS-specific and would need porting to run a different model:
   - `additional_information`'s schema (`speech.rs`) --
     `{text, task_type, language, speaker, instruct}` is
     `Qwen3TTSPromptEmbedsBuilder`'s input contract specifically, and there's
@@ -307,8 +320,9 @@ print(model.transcribe(audio, fp16=False)['text'])
   - `TtsRouter::estimate_prompt_len` (`routing.rs`) -- reimplements
     Qwen3-TTS's exact chat-template token-counting formula; other models
     compute this differently.
-  - `TtsRouter::new` hard-requires exactly 2 stages and unconditionally
-    treats stage 0 as talker / stage 1 as code2wav.
+  - Only linear chains are supported (each stage has at most one upstream
+    source) -- every pipeline checked so far is linear, but a genuinely
+    branching DAG (a stage fed by more than one upstream) isn't handled.
 - `stream: true` is rejected outright -- responses are always fully
   buffered before being returned.
 - Requires the vllm-omni patch above; there is intentionally no fallback
