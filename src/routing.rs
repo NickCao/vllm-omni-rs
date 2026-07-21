@@ -61,10 +61,11 @@ impl TtsRouter {
         let start = Instant::now();
 
         // === Stage 0: Talker ===
+        let sp = sampling_params.unwrap_or_else(default_tts_sampling_params);
         let stage0_req = EngineCoreRequest {
             request_id: request_id.to_string(),
             prompt_token_ids: Some(prompt_token_ids),
-            sampling_params,
+            sampling_params: Some(sp),
             arrival_time: now_secs(),
             additional_information: Some(additional_info.clone()),
             external_req_id: Some(request_id.to_string()),
@@ -164,6 +165,20 @@ impl TtsRouter {
             let _ = self.stage1.shutdown().await;
         });
         Ok(())
+    }
+}
+
+fn default_tts_sampling_params() -> EngineCoreSamplingParams {
+    EngineCoreSamplingParams {
+        temperature: 0.9,
+        top_p: 1.0,
+        top_k: 50,
+        repetition_penalty: 1.05,
+        max_tokens: 4096,
+        min_tokens: 2,
+        stop_token_ids: vec![2150],
+        all_stop_token_ids: [2150].into(),
+        ..Default::default()
     }
 }
 
