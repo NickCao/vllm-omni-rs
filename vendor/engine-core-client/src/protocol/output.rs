@@ -138,7 +138,45 @@ impl EngineCoreOutput {
         self.new_prompt_logprobs_tensors = (self.new_prompt_logprobs_tensors.take())
             .map(|value| value.resolve(frames, "new_prompt_logprobs_tensors"))
             .transpose()?;
+        // Resolve omni multimodal_output tensor aux frame references
+        if let Some(ref mut mm) = self.multimodal_output {
+            resolve_opaque_tensors(mm, frames);
+        }
         Ok(())
+    }
+}
+
+/// Resolve aux frame references inside an OpaqueValue tree.
+/// Tensor wire format is (dtype, shape, data) where data can be an integer
+/// index into the ZMQ aux frames.
+fn resolve_opaque_tensors<Frame: AsRef<[u8]>>(value: &mut OpaqueValue, frames: &[Frame]) {
+    match value {
+        rmpv::Value::Map(entries) => {
+            for (_, v) in entries.iter_mut() {
+                resolve_opaque_tensors(v, frames);
+            }
+        }
+        rmpv::Value::Array(arr) if arr.len() == 3 => {
+            // Check if this looks like a tensor: (string, array, int)
+            if matches!(&arr[0], rmpv::Value::String(_))
+                && matches!(&arr[1], rmpv::Value::Array(_))
+            {
+                if let rmpv::Value::Integer(idx) = &arr[2] {
+                    if let Some(i) = idx.as_u64() {
+                        let i = i as usize;
+                        if i < frames.len() {
+                            arr[2] = rmpv::Value::Binary(frames[i].as_ref().to_vec());
+                        }
+                    }
+                }
+            }
+        }
+        rmpv::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                resolve_opaque_tensors(v, frames);
+            }
+        }
+        _ => {}
     }
 }
 

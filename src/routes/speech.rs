@@ -132,7 +132,8 @@ fn extract_audio_from_opaque(value: &OpaqueValue, response_format: &str) -> Resu
     // where tensors contains {"audio": (dtype, shape, data), "sr": (dtype, shape, data)}.
     // Or it may be a flat map {"audio": tensor, "sr": tensor}.
     let audio_tensor = find_tensor_in_value(val, "audio")
-        .ok_or_else(|| anyhow::anyhow!("No 'audio' tensor found in multimodal output"))?;
+        .or_else(|| find_tensor_in_value(val, "model_outputs"))
+        .ok_or_else(|| anyhow::anyhow!("No audio tensor found in multimodal output"))?;
     let sr = find_scalar_in_value(val, "sr").unwrap_or(24000);
 
     // audio_tensor is (dtype_str, shape, raw_bytes)
