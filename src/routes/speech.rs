@@ -90,6 +90,7 @@ pub async fn create_speech(
     };
 
     let prompt_len = state.router.estimate_prompt_len(&req.input, req.instructions.as_deref());
+    debug!("Prompt length estimate: {prompt_len} for input: {:?}", &req.input);
     let prompt_token_ids: Vec<u32> = vec![1; prompt_len];
 
     match state.router.generate_speech(
