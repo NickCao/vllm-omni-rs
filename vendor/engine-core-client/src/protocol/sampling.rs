@@ -7,7 +7,6 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_default::DefaultFromSerde;
-use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use crate::protocol::OpaqueValue;
 
@@ -25,7 +24,7 @@ use crate::protocol::OpaqueValue;
 /// 30: extra_args, 31: routed_experts_prompt_start, 32: bad_words,
 /// 33: _bad_words_token_ids, 34: skip_reading_prefix_cache,
 /// 35: thinking_token_budget, 36: repetition_detection
-#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple, DefaultFromSerde)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, DefaultFromSerde)]
 pub struct EngineCoreSamplingParams {
     #[serde(default = "default_n")]
     pub n: u32,
