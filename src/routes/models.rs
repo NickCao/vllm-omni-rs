@@ -1,5 +1,8 @@
 use axum::Json;
+use axum::extract::State;
 use serde::Serialize;
+
+use crate::server::AppState;
 
 #[derive(Serialize)]
 pub struct ModelObject {
@@ -14,9 +17,7 @@ pub struct ModelList {
     pub data: Vec<ModelObject>,
 }
 
-pub async fn list_models(
-    axum::extract::State(state): axum::extract::State<crate::server::AppState>,
-) -> Json<ModelList> {
+pub async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
     Json(ModelList {
         object: "list",
         data: vec![ModelObject {

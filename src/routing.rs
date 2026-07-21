@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use vllm_engine_core_client::EngineCoreClient;
 use vllm_engine_core_client::protocol::OpaqueValue;
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
@@ -19,35 +19,34 @@ use vllm_tokenizer::{HuggingFaceTokenizer, Tokenizer};
 use crate::master::ConnectedStage;
 
 pub struct TtsRouter {
-    pub stage0: EngineCoreClient,
-    pub stage1: EngineCoreClient,
-    tokenizer: Option<HuggingFaceTokenizer>,
+    stage0: EngineCoreClient,
+    stage1: EngineCoreClient,
+    tokenizer: HuggingFaceTokenizer,
 }
 
 impl TtsRouter {
-    pub fn new(stages: Vec<ConnectedStage>, tokenizer_path: Option<&str>) -> Result<Self> {
+    pub fn new(stages: Vec<ConnectedStage>, tokenizer_path: &str) -> Result<Self> {
         if stages.len() != 2 {
             bail!("TTS requires 2 stages, got {}", stages.len());
         }
-        let mut s0 = None;
-        let mut s1 = None;
+        let mut stage0 = None;
+        let mut stage1 = None;
         for s in stages {
             match s.stage_id {
-                0 => s0 = Some(s.client),
-                1 => s1 = Some(s.client),
+                0 => stage0 = Some(s.client),
+                1 => stage1 = Some(s.client),
                 id => bail!("Unexpected stage_id: {id}"),
             }
         }
 
-        let tokenizer_path = tokenizer_path.context("--tokenizer-path is required")?;
         let tokenizer = HuggingFaceTokenizer::new(Path::new(tokenizer_path))
             .context(format!("Failed to load tokenizer from {tokenizer_path}"))?;
         info!("Tokenizer loaded from {tokenizer_path}");
 
         Ok(Self {
-            stage0: s0.context("Stage 0 not found")?,
-            stage1: s1.context("Stage 1 not found")?,
-            tokenizer: Some(tokenizer),
+            stage0: stage0.context("Stage 0 not found")?,
+            stage1: stage1.context("Stage 1 not found")?,
+            tokenizer,
         })
     }
 
@@ -59,7 +58,6 @@ impl TtsRouter {
         request_id: &str,
         prompt_token_ids: Vec<u32>,
         additional_info: OpaqueValue,
-        _sampling_params: Option<EngineCoreSamplingParams>,
     ) -> Result<Vec<OpaqueValue>> {
         let start = Instant::now();
 
@@ -75,7 +73,10 @@ impl TtsRouter {
         };
 
         debug!("[{request_id}] Submitting to stage 0 (talker)");
-        let mut stream0 = self.stage0.call(stage0_req).await
+        let mut stream0 = self
+            .stage0
+            .call(stage0_req)
+            .await
             .context("Stage 0 call failed")?;
 
         // Submit stage 1 (code2wav) with a minimal placeholder.
@@ -96,7 +97,10 @@ impl TtsRouter {
         };
 
         debug!("[{request_id}] Submitting to stage 1 (code2wav)");
-        let mut stream1 = self.stage1.call(stage1_req).await
+        let mut stream1 = self
+            .stage1
+            .call(stage1_req)
+            .await
             .context("Stage 1 call failed")?;
 
         // Wait for stage 0 to finish (generates codec tokens)
@@ -104,7 +108,9 @@ impl TtsRouter {
         while let Some(result) = stream0.next().await {
             let output = result.context("Stage 0 stream error")?;
             token_count += output.new_token_ids.len() as u64;
-            if output.finished() { break; }
+            if output.finished() {
+                break;
+            }
         }
         let stage0_ms = start.elapsed().as_millis();
         info!("[{request_id}] Stage 0 done: {token_count} tokens, {stage0_ms}ms");
@@ -119,28 +125,36 @@ impl TtsRouter {
             if let Some(mm) = output.multimodal_output.clone() {
                 audio_chunks.push(mm);
             }
-            if output.finished() { break; }
+            if output.finished() {
+                break;
+            }
         }
 
         let total_ms = start.elapsed().as_millis();
-        info!("[{request_id}] Done: {total_ms}ms, chunks={}", audio_chunks.len());
+        info!(
+            "[{request_id}] Done: {total_ms}ms, chunks={}",
+            audio_chunks.len()
+        );
 
         Ok(audio_chunks)
     }
 
     pub fn estimate_prompt_len(&self, text: &str, instruct: Option<&str>) -> usize {
-        let Some(ref tok) = self.tokenizer else { return 2048; };
         let tokenize = |s: &str| -> usize {
-            tok.encode(s, false).map(|ids| ids.len()).unwrap_or(0)
+            self.tokenizer
+                .encode(s, false)
+                .map(|ids| ids.len())
+                .unwrap_or(0)
         };
         let instruct_len = match instruct {
-            Some(i) if !i.trim().is_empty() =>
-                tokenize(&format!("<|im_start|>user\n{i}<|im_end|>\n")),
+            Some(i) if !i.trim().is_empty() => {
+                tokenize(&format!("<|im_start|>user\n{i}<|im_end|>\n"))
+            }
             _ => 0,
         };
-        let assistant_len = tokenize(
-            &format!("<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n")
-        );
+        let assistant_len = tokenize(&format!(
+            "<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+        ));
         instruct_len + 3 + 5 + assistant_len.saturating_sub(6)
     }
 

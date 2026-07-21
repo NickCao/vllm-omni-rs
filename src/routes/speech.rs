@@ -3,26 +3,29 @@
 //! Uses TtsRouter for ZMQ-native 2-stage routing.
 //! Zero Python per request.
 
-
+use std::collections::BTreeMap;
 use std::io::Cursor;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{error, debug};
+use tracing::{debug, error};
 use uuid::Uuid;
 use vllm_engine_core_client::protocol::OpaqueValue;
+use vllm_engine_core_client::protocol::tensor::WireTensor;
 
 use crate::server::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct SpeechRequest {
     pub input: String,
+    /// Accepted for OpenAI API compatibility; this server hosts a single model.
     #[serde(default)]
+    #[allow(dead_code)]
     pub model: Option<String>,
     #[serde(default)]
     pub voice: Option<String>,
@@ -32,7 +35,9 @@ pub struct SpeechRequest {
     pub response_format: String,
     #[serde(default)]
     pub stream: bool,
+    /// Only meaningful when `stream` is set, which is rejected below.
     #[serde(default)]
+    #[allow(dead_code)]
     pub stream_format: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
@@ -42,55 +47,92 @@ fn default_response_format() -> String {
     "wav".to_string()
 }
 
+/// Wire format for `additional_information`, matching vllm-omni's
+/// `AdditionalInformationPayload` msgspec struct.
+#[derive(Serialize)]
+struct AdditionalInformation {
+    entries: BTreeMap<&'static str, InfoEntry>,
+}
+
+#[derive(Serialize, Default)]
+struct InfoEntry {
+    tensor_data: Option<Vec<u8>>,
+    tensor_shape: Option<Vec<u32>>,
+    tensor_dtype: Option<String>,
+    list_data: Vec<String>,
+    scalar_data: Option<f64>,
+}
+
+impl InfoEntry {
+    fn text(value: impl Into<String>) -> Self {
+        Self {
+            list_data: vec![value.into()],
+            ..Default::default()
+        }
+    }
+}
+
 pub async fn create_speech(
     State(state): State<AppState>,
     Json(req): Json<SpeechRequest>,
 ) -> Response {
+    if req.stream {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "stream=true is not supported; this endpoint always returns a complete audio file",
+        );
+    }
+
     let request_id = format!("speech-{}", Uuid::new_v4());
     let response_format = req.response_format.clone();
 
-    // Build additional_information for stage 0
-    let task_type = req.extra.get("task_type").and_then(|v| v.as_str()).unwrap_or("CustomVoice");
-    let language = req.extra.get("language").and_then(|v| v.as_str()).unwrap_or("Auto");
+    let task_type = req
+        .extra
+        .get("task_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("CustomVoice");
+    let language = req
+        .extra
+        .get("language")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Auto");
     let speaker = req.voice.as_deref().unwrap_or("Vivian");
 
-    // Build AdditionalInformationPayload as rmpv::Value directly
-    // Format: {"entries": {"key": {"list_data": [val], "tensor_data": nil, ...}, ...}}
-    let make_entry = |vals: Vec<rmpv::Value>| -> rmpv::Value {
-        rmpv::Value::Map(vec![
-            (rmpv::Value::String("tensor_data".into()), rmpv::Value::Nil),
-            (rmpv::Value::String("tensor_shape".into()), rmpv::Value::Nil),
-            (rmpv::Value::String("tensor_dtype".into()), rmpv::Value::Nil),
-            (rmpv::Value::String("list_data".into()), rmpv::Value::Array(vals)),
-            (rmpv::Value::String("scalar_data".into()), rmpv::Value::Nil),
-        ])
-    };
-
-    let mut entries = vec![
-        (rmpv::Value::String("text".into()), make_entry(vec![rmpv::Value::String(req.input.clone().into())])),
-        (rmpv::Value::String("task_type".into()), make_entry(vec![rmpv::Value::String(task_type.to_string().into())])),
-        (rmpv::Value::String("language".into()), make_entry(vec![rmpv::Value::String(language.to_string().into())])),
-        (rmpv::Value::String("speaker".into()), make_entry(vec![rmpv::Value::String(speaker.to_string().into())])),
-    ];
-
+    let mut entries = BTreeMap::from([
+        ("text", InfoEntry::text(req.input.clone())),
+        ("task_type", InfoEntry::text(task_type)),
+        ("language", InfoEntry::text(language)),
+        ("speaker", InfoEntry::text(speaker)),
+    ]);
     if let Some(ref inst) = req.instructions {
-        entries.push((rmpv::Value::String("instruct".into()), make_entry(vec![rmpv::Value::String(inst.clone().into())])));
+        entries.insert("instruct", InfoEntry::text(inst.clone()));
     }
 
-    let additional_info: OpaqueValue = rmpv::Value::Map(vec![
-        (rmpv::Value::String("entries".into()), rmpv::Value::Map(entries)),
-    ]);
+    let additional_info: OpaqueValue = match rmpv::ext::to_value(&AdditionalInformation { entries })
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to encode additional_information: {e:#}"),
+            );
+        }
+    };
 
-    let prompt_len = state.router.estimate_prompt_len(&req.input, req.instructions.as_deref());
-    debug!("Prompt length estimate: {prompt_len} for input: {:?}", &req.input);
+    let prompt_len = state
+        .router
+        .estimate_prompt_len(&req.input, req.instructions.as_deref());
+    debug!(
+        "Prompt length estimate: {prompt_len} for input: {:?}",
+        &req.input
+    );
     let prompt_token_ids: Vec<u32> = vec![1; prompt_len];
 
-    match state.router.generate_speech(
-        &request_id,
-        prompt_token_ids,
-        additional_info,
-        None,
-    ).await {
+    match state
+        .router
+        .generate_speech(&request_id, prompt_token_ids, additional_info)
+        .await
+    {
         Ok(chunks) if !chunks.is_empty() => {
             debug!("Received {} audio chunks", chunks.len());
             match extract_and_concat_audio(&chunks, &response_format) {
@@ -99,7 +141,10 @@ pub async fn create_speech(
                     headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
                     (headers, audio_bytes).into_response()
                 }
-                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Audio extraction: {e:#}")),
+                Err(e) => error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Audio extraction: {e:#}"),
+                ),
             }
         }
         Ok(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "No audio output"),
@@ -110,19 +155,81 @@ pub async fn create_speech(
     }
 }
 
+/// Stage 1's `multimodal_output`. Qwen3-TTS code2wav emits a flat
+/// `{"model_outputs": tensor, "sr": tensor}` map; other omni models nest
+/// tensors under `"tensors"` or place the sample rate under `"metadata"`,
+/// so both are checked as fallbacks.
+#[derive(Debug, Default, Deserialize)]
+struct MultimodalOutput {
+    #[serde(default)]
+    audio: Option<WireTensor>,
+    #[serde(default)]
+    model_outputs: Option<WireTensor>,
+    #[serde(default)]
+    sr: Option<SampleRate>,
+    #[serde(default)]
+    tensors: Option<Box<MultimodalOutput>>,
+    #[serde(default)]
+    metadata: Option<Metadata>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Metadata {
+    #[serde(default)]
+    sr: Option<SampleRate>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SampleRate {
+    Scalar(u32),
+    Tensor(WireTensor),
+}
+
+impl SampleRate {
+    fn resolve(&self) -> Result<u32> {
+        match self {
+            Self::Scalar(v) => Ok(*v),
+            Self::Tensor(t) => scalar_from_tensor(t),
+        }
+    }
+}
+
+impl MultimodalOutput {
+    fn audio_tensor(&self) -> Option<&WireTensor> {
+        self.audio
+            .as_ref()
+            .or(self.model_outputs.as_ref())
+            .or_else(|| self.tensors.as_deref().and_then(Self::audio_tensor))
+    }
+
+    fn sample_rate(&self) -> Option<&SampleRate> {
+        self.sr
+            .as_ref()
+            .or_else(|| self.metadata.as_ref().and_then(|m| m.sr.as_ref()))
+            .or_else(|| self.tensors.as_deref().and_then(Self::sample_rate))
+    }
+}
+
 /// Extract PCM bytes from each chunk (DELTA output_kind -- each chunk is a
 /// new audio slice) and concatenate them in order, matching the Python
 /// frontend's `torch.cat` over all streamed audio deltas.
-fn extract_and_concat_audio(chunks: &[OpaqueValue], response_format: &str) -> Result<(Vec<u8>, &'static str)> {
+fn extract_and_concat_audio(
+    chunks: &[OpaqueValue],
+    response_format: &str,
+) -> Result<(Vec<u8>, &'static str)> {
     let mut sr = 24000u32;
     let mut pcm_f32_bytes: Vec<u8> = Vec::new();
     for chunk in chunks {
-        let Some(audio_tensor) = find_tensor_in_value(chunk, "audio")
-            .or_else(|| find_tensor_in_value(chunk, "model_outputs")) else { continue };
-        if let Some(found_sr) = find_scalar_in_value(chunk, "sr") {
-            sr = found_sr;
+        let mm: MultimodalOutput =
+            rmpv::ext::from_value(chunk.clone()).context("failed to decode multimodal_output")?;
+        let Some(audio) = mm.audio_tensor() else {
+            continue;
+        };
+        if let Some(rate) = mm.sample_rate() {
+            sr = rate.resolve()?;
         }
-        pcm_f32_bytes.extend(decode_tensor_bytes(&audio_tensor)?);
+        pcm_f32_bytes.extend_from_slice(raw_view_bytes(audio)?);
     }
     if pcm_f32_bytes.is_empty() {
         anyhow::bail!("No audio tensor found in any multimodal output chunk");
@@ -130,91 +237,33 @@ fn extract_and_concat_audio(chunks: &[OpaqueValue], response_format: &str) -> Re
     encode_audio(&pcm_f32_bytes, sr, response_format)
 }
 
-/// Find a tensor value by key in a potentially nested rmpv structure.
-fn find_tensor_in_value(val: &rmpv::Value, key: &str) -> Option<rmpv::Value> {
-    match val {
-        rmpv::Value::Map(entries) => {
-            for (k, v) in entries {
-                if let rmpv::Value::String(s) = k {
-                    if s.as_str() == Some(key) {
-                        return Some(v.clone());
-                    }
-                    if s.as_str() == Some("tensors") {
-                        return find_tensor_in_value(v, key);
-                    }
-                }
-            }
-            None
-        }
-        _ => None,
+fn raw_view_bytes(tensor: &WireTensor) -> Result<&[u8]> {
+    tensor
+        .data
+        .as_raw_view()
+        .map(Vec::as_slice)
+        .with_context(|| {
+            format!(
+                "tensor '{}' uses an unresolved aux-frame reference",
+                tensor.dtype
+            )
+        })
+}
+
+fn scalar_from_tensor(tensor: &WireTensor) -> Result<u32> {
+    let bytes = raw_view_bytes(tensor)?;
+    match tensor.dtype.as_str() {
+        "int32" | "uint32" => Ok(i32::from_le_bytes(bytes[..4].try_into()?) as u32),
+        "int64" | "uint64" => Ok(i64::from_le_bytes(bytes[..8].try_into()?) as u32),
+        other => anyhow::bail!("unsupported scalar dtype for sample rate: {other}"),
     }
 }
 
-/// Find a scalar integer value by key.
-fn find_scalar_in_value(val: &rmpv::Value, key: &str) -> Option<u32> {
-    match val {
-        rmpv::Value::Map(entries) => {
-            for (k, v) in entries {
-                if let rmpv::Value::String(s) = k {
-                    if s.as_str() == Some(key) {
-                        return extract_scalar_u32(v);
-                    }
-                    if s.as_str() == Some("tensors") || s.as_str() == Some("metadata") {
-                        if let Some(r) = find_scalar_in_value(v, key) {
-                            return Some(r);
-                        }
-                    }
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-fn extract_scalar_u32(val: &rmpv::Value) -> Option<u32> {
-    match val {
-        rmpv::Value::Integer(i) => i.as_u64().map(|v| v as u32),
-        // Tensor format: (dtype, shape, data) -- extract scalar from data
-        rmpv::Value::Array(arr) if arr.len() == 3 => {
-            // data is raw bytes, dtype tells us the type
-            if let rmpv::Value::Binary(bytes) = &arr[2] {
-                if bytes.len() == 4 {
-                    return Some(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32);
-                }
-            }
-            // Could be an Ext type
-            if let rmpv::Value::Ext(_, bytes) = &arr[2] {
-                if bytes.len() == 4 {
-                    return Some(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32);
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-/// Decode raw bytes from a tensor wire format (dtype, shape, data).
-fn decode_tensor_bytes(val: &rmpv::Value) -> Result<Vec<u8>> {
-    match val {
-        rmpv::Value::Array(arr) if arr.len() == 3 => {
-            match &arr[2] {
-                rmpv::Value::Binary(bytes) => Ok(bytes.clone()),
-                rmpv::Value::Ext(_, bytes) => Ok(bytes.clone()),
-                // Could be an integer index into aux buffers (zero-copy path)
-                rmpv::Value::Integer(idx) => {
-                    anyhow::bail!("Tensor uses aux buffer index {idx} -- zero-copy not supported in this path")
-                }
-                other => anyhow::bail!("Unexpected tensor data type: {:?}", other),
-            }
-        }
-        rmpv::Value::Binary(bytes) => Ok(bytes.clone()),
-        other => anyhow::bail!("Cannot decode tensor from: {:?}", other),
-    }
-}
-
-fn encode_audio(pcm_f32_bytes: &[u8], sample_rate: u32, format: &str) -> Result<(Vec<u8>, &'static str)> {
+fn encode_audio(
+    pcm_f32_bytes: &[u8],
+    sample_rate: u32,
+    format: &str,
+) -> Result<(Vec<u8>, &'static str)> {
     let samples_f32: &[f32] = bytemuck::cast_slice(pcm_f32_bytes);
     let samples_i16: Vec<i16> = samples_f32
         .iter()
@@ -235,7 +284,9 @@ fn encode_audio(pcm_f32_bytes: &[u8], sample_rate: u32, format: &str) -> Result<
                 sample_format: hound::SampleFormat::Int,
             };
             let mut writer = hound::WavWriter::new(&mut cursor, spec)?;
-            for &s in &samples_i16 { writer.write_sample(s)?; }
+            for &s in &samples_i16 {
+                writer.write_sample(s)?;
+            }
             writer.finalize()?;
             (cursor.into_inner(), "audio/wav")
         }
@@ -243,5 +294,9 @@ fn encode_audio(pcm_f32_bytes: &[u8], sample_rate: u32, format: &str) -> Result<
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
-    (status, Json(serde_json::json!({"error": {"message": message, "type": "server_error"}}))).into_response()
+    (
+        status,
+        Json(serde_json::json!({"error": {"message": message, "type": "server_error"}})),
+    )
+        .into_response()
 }

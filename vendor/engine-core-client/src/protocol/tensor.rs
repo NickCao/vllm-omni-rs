@@ -176,13 +176,18 @@ impl<'de> Deserialize<'de> for WireArrayData {
             Value::Ext(tag, _) => Err(serde::de::Error::custom(format!(
                 "unsupported extension type code {tag}"
             ))),
+            // `EngineCoreClient::resolve_in_place` rewrites aux-frame indices
+            // to inline `Binary` once the referenced frame is available, so a
+            // fully-resolved `OpaqueValue` tree carries `Binary` rather than
+            // `Ext` for what were originally aux-indexed tensors.
+            Value::Binary(bytes) => Ok(Self::RawView(bytes)),
             Value::Integer(index) => {
                 index.as_u64().map(|index| Self::AuxIndex(index as usize)).ok_or_else(|| {
                     serde::de::Error::custom("aux frame index must be a non-negative integer")
                 })
             }
             other => Err(serde::de::Error::custom(format!(
-                "expected raw-view ext or aux frame index, got {other:?}"
+                "expected raw-view ext/binary or aux frame index, got {other:?}"
             ))),
         }
     }

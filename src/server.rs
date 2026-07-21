@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use axum::routing::{get, post};
 use axum::Router;
+use axum::routing::{get, post};
 use tower_http::cors::CorsLayer;
 
 use crate::routes;

@@ -24,7 +24,7 @@ mod stages;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -37,43 +37,35 @@ use crate::stages::{StageSpawnConfig, shutdown_stages, spawn_stages};
 /// Extract tokenizer.json from the model using a one-time Python call.
 /// The HF repo doesn't ship tokenizer.json but the Python tokenizer
 /// builds one from vocab.json + merges.txt.
-fn extract_tokenizer(model: &str) -> Option<String> {
-    let path = format!("/tmp/_vllm_omni_rs_tokenizer_{}.json", model.replace('/', "_"));
+fn extract_tokenizer(model: &str) -> Result<String> {
+    let path = format!(
+        "/tmp/_vllm_omni_rs_tokenizer_{}.json",
+        model.replace('/', "_")
+    );
     if std::path::Path::new(&path).exists() {
         info!("Using cached tokenizer: {path}");
-        return Some(path);
+        return Ok(path);
     }
-    let script = format!(
-        "from transformers import AutoTokenizer; \
-         t = AutoTokenizer.from_pretrained('{}', trust_remote_code=True); \
-         t.backend_tokenizer.save('{}')",
-        model, path
-    );
-    match std::process::Command::new("python3")
-        .args(["-c", &script])
+    // model/path are passed as argv, not interpolated into the script, so
+    // neither can break out of the Python string literal they'd otherwise sit in.
+    const SCRIPT: &str = "import sys; \
+        from transformers import AutoTokenizer; \
+        t = AutoTokenizer.from_pretrained(sys.argv[1], trust_remote_code=True); \
+        t.backend_tokenizer.save(sys.argv[2])";
+    let output = std::process::Command::new("python3")
+        .args(["-c", SCRIPT, model, &path])
         .output()
-    {
-        Ok(output) if output.status.success() => {
-            info!("Extracted tokenizer to {path}");
-            Some(path)
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!("Failed to extract tokenizer: {stderr}");
-            None
-        }
-        Err(e) => {
-            tracing::warn!("Failed to run python3 for tokenizer: {e}");
-            None
-        }
+        .context("failed to run python3 for tokenizer extraction")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("tokenizer extraction failed: {stderr}");
     }
+    info!("Extracted tokenizer to {path}");
+    Ok(path)
 }
 
 #[derive(Parser)]
-#[command(
-    name = "vllm-omni-rs",
-    about = "Rust HTTP frontend for vllm-omni TTS"
-)]
+#[command(name = "vllm-omni-rs", about = "Rust HTTP frontend for vllm-omni TTS")]
 struct Cli {
     /// Model name or path.
     model: String,
@@ -106,8 +98,7 @@ struct Cli {
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -126,8 +117,8 @@ fn main() -> Result<()> {
 
     rt.block_on(async move {
         // 1. Allocate master registration port
-        let master_port = allocate_handshake_port(&cli.master_host)
-            .context("Failed to allocate master port")?;
+        let master_port =
+            allocate_handshake_port(&cli.master_host).context("Failed to allocate master port")?;
         info!("Master registration port: {master_port}");
 
         // 2. Spawn headless Python stages
@@ -161,11 +152,15 @@ fn main() -> Result<()> {
         );
 
         // 4. Create TTS router
-        let router = Arc::new(TtsRouter::new(
-            connected_stages,
-            cli.tokenizer_path.as_deref(),
-        ).context("Failed to create TTS router")?);
-
+        let tokenizer_path = match cli.tokenizer_path {
+            Some(path) => path,
+            None => extract_tokenizer(&cli.model)
+                .context("No --tokenizer-path given and auto-extraction failed")?,
+        };
+        let router = Arc::new(
+            TtsRouter::new(connected_stages, &tokenizer_path)
+                .context("Failed to create TTS router")?,
+        );
 
         // 5. Start HTTP server
         let state = server::AppState {
@@ -205,12 +200,10 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        )
-        .expect("Failed to install SIGTERM handler")
-        .recv()
-        .await;
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
     };
 
     #[cfg(not(unix))]

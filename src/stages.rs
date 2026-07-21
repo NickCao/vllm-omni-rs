@@ -74,9 +74,9 @@ pub async fn spawn_stages(config: &StageSpawnConfig) -> Result<Vec<StageProcess>
             });
         }
 
-        let child = cmd.spawn().context(format!(
-            "failed to spawn headless stage {stage_id}"
-        ))?;
+        let child = cmd
+            .spawn()
+            .context(format!("failed to spawn headless stage {stage_id}"))?;
 
         info!(
             "Spawned headless stage {} (pid={})",
@@ -84,10 +84,7 @@ pub async fn spawn_stages(config: &StageSpawnConfig) -> Result<Vec<StageProcess>
             child.id().unwrap_or(0)
         );
 
-        processes.push(StageProcess {
-            stage_id,
-            child,
-        });
+        processes.push(StageProcess { stage_id, child });
     }
 
     Ok(processes)

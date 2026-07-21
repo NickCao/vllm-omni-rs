@@ -5,18 +5,14 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rmp_serde;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
-use vllm_engine_core_client::{
-    EngineCoreClient, EngineCoreClientConfig, TransportMode,
-};
+use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig, TransportMode};
 
 /// Allocated addresses for one stage.
 #[derive(Debug, Clone)]
 pub struct StageAllocation {
     pub stage_id: u32,
-    pub replica_id: u32,
     pub handshake_address: String,
     pub input_address: String,
     pub output_address: String,
@@ -33,10 +29,6 @@ struct RegistrationRequest {
     stage_id: u32,
     #[serde(default)]
     replica_id: i32,
-    #[serde(default)]
-    stage_config: Option<rmpv::Value>,
-    #[serde(default)]
-    replica_bind_address: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,8 +48,7 @@ fn allocate_ports(
     let mut ports = Vec::with_capacity(count);
     for _ in 0..count {
         loop {
-            let listener =
-                TcpListener::bind((host, 0)).context("failed to allocate port")?;
+            let listener = TcpListener::bind((host, 0)).context("failed to allocate port")?;
             let port = listener.local_addr()?.port();
             if exclude.insert(port) {
                 ports.push(port);
@@ -80,8 +71,7 @@ pub async fn start_and_connect_stages(
     handshake_timeout: Duration,
 ) -> Result<Vec<ConnectedStage>> {
     // Phase 1: Registration (blocking ZMQ)
-    let allocations =
-        run_registration(bind_host, bind_port, &expected_stages).await?;
+    let allocations = run_registration(bind_host, bind_port, &expected_stages).await?;
 
     // Phase 2: Connect EngineCoreClient to each stage
     // The engine cores connect to the handshake address after registration.
@@ -107,12 +97,10 @@ pub async fn start_and_connect_stages(
             client_index: 0,
         };
 
-        let client = EngineCoreClient::connect(config)
-            .await
-            .context(format!(
-                "Failed to connect to stage {} engine core",
-                alloc.stage_id
-            ))?;
+        let client = EngineCoreClient::connect(config).await.context(format!(
+            "Failed to connect to stage {} engine core",
+            alloc.stage_id
+        ))?;
 
         info!("Stage {} engine core connected", alloc.stage_id);
         connected.push(ConnectedStage {
@@ -145,14 +133,11 @@ async fn run_registration(
             .context(format!("failed to bind to {addr}"))?;
 
         let mut allocs: HashMap<u32, StageAllocation> = HashMap::new();
-        let mut used_ports: std::collections::HashSet<u16> =
-            std::collections::HashSet::new();
+        let mut used_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
         used_ports.insert(bind_port);
 
         while allocs.len() < expected.len() {
-            let frames = socket
-                .recv_multipart(0)
-                .context("recv_multipart failed")?;
+            let frames = socket.recv_multipart(0).context("recv_multipart failed")?;
             if frames.len() < 2 {
                 continue;
             }
@@ -173,15 +158,17 @@ async fn run_registration(
                 continue;
             }
 
-            let replica_id =
-                if req.replica_id < 0 { 0u32 } else { req.replica_id as u32 };
+            let replica_id = if req.replica_id < 0 {
+                0u32
+            } else {
+                req.replica_id as u32
+            };
 
-            let ports = allocate_ports(&host, 3, &mut used_ports)
-                .context("failed to allocate ports")?;
+            let ports =
+                allocate_ports(&host, 3, &mut used_ports).context("failed to allocate ports")?;
 
             let alloc = StageAllocation {
                 stage_id: req.stage_id,
-                replica_id,
                 handshake_address: format!("tcp://{}:{}", host, ports[0]),
                 input_address: format!("tcp://{}:{}", host, ports[1]),
                 output_address: format!("tcp://{}:{}", host, ports[2]),
@@ -195,13 +182,10 @@ async fn run_registration(
                 coordinator_router_address: None,
             };
 
-            let response_bytes = rmp_serde::to_vec_named(&response)
-                .context("failed to encode response")?;
+            let response_bytes =
+                rmp_serde::to_vec_named(&response).context("failed to encode response")?;
             socket
-                .send_multipart(
-                    &[identity.as_slice(), &response_bytes],
-                    0,
-                )
+                .send_multipart(&[identity.as_slice(), &response_bytes], 0)
                 .context("send_multipart failed")?;
 
             info!(
