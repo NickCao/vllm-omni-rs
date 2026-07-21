@@ -167,8 +167,9 @@ fn default_tts_sampling_params() -> EngineCoreSamplingParams {
 
 fn default_code2wav_sampling_params() -> EngineCoreSamplingParams {
     EngineCoreSamplingParams {
+        temperature: 0.0, // greedy for vocoder
         max_tokens: 65536,
-        output_kind: 0, // CUMULATIVE -- stage 1 produces outputs as codec chunks arrive
+        output_kind: 1, // DELTA -- matches Python's coerce for streaming
         ..Default::default()
     }
 }
