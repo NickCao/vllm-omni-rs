@@ -109,6 +109,11 @@ impl TtsRouter {
         let stage0_ms = start.elapsed().as_millis();
         info!("[{request_id}] Stage 0 done: {token_count} tokens, {stage0_ms}ms");
 
+        // Wait for connector save_loop to process remaining chunks.
+        // Stage 0's background thread needs time to write all codec
+        // chunks to /dev/shm before stage 1 tries to read them.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
         // Collect stage 1 output (audio)
         let mut audio_output: Option<OpaqueValue> = None;
         while let Some(result) = stream1.next().await {
