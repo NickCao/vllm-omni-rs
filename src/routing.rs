@@ -208,6 +208,7 @@ fn default_tts_sampling_params() -> EngineCoreSamplingParams {
         min_tokens: 2,
         stop_token_ids: vec![2150],
         all_stop_token_ids: [2150].into(),
+        output_kind: 2, // FINAL_ONLY
         ..Default::default()
     }
 }
