@@ -8,6 +8,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod engine;
+mod master;
 mod routes;
 mod server;
 
