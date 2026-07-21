@@ -221,38 +221,74 @@ impl OmniEngine {
 
 /// Extract audio tensor bytes from an OmniRequestOutput.
 ///
-/// For Qwen3 TTS, the audio lives at:
-///   output.multimodal_output["model_outputs"] -> list of float32 tensors
-///   output.multimodal_output["sr"] -> list of sample rates
+/// The multimodal_output may be a MultimodalPayload (tensors + metadata)
+/// or a plain dict. Audio key is "audio" or "model_outputs".
+/// Sample rate is in "sr" (metadata or dict value).
 pub fn extract_audio(
     py: Python<'_>,
     output: &PyObject,
 ) -> Option<(Vec<u8>, u32)> {
     let obj = output.bind(py);
 
-    let mm_output = obj.getattr("multimodal_output").ok()?;
-    if mm_output.is_none() {
+    let mm = obj.getattr("multimodal_output").ok()?;
+    if mm.is_none() || !mm.is_truthy().unwrap_or(false) {
         return None;
     }
 
-    let model_outputs = mm_output.get_item("model_outputs").ok()?;
-    let sr_list = mm_output.get_item("sr").ok()?;
+    // Find the audio tensor -- try "audio" first, then "model_outputs"
+    let audio_key = if mm.contains("audio").unwrap_or(false) {
+        "audio"
+    } else if mm.contains("model_outputs").unwrap_or(false) {
+        "model_outputs"
+    } else {
+        return None;
+    };
 
-    let outputs_list =
-        model_outputs.downcast::<pyo3::types::PyList>().ok()?;
-    if outputs_list.is_empty() {
+    let audio_val = mm.get_item(audio_key).ok()?;
+
+    // Audio value may be a single tensor or a list of tensors
+    let tensor = if let Ok(list) =
+        audio_val.downcast::<pyo3::types::PyList>()
+    {
+        if list.is_empty() {
+            return None;
+        }
+        list.get_item(0).ok()?
+    } else {
+        audio_val
+    };
+
+    // Skip empty tensors
+    let numel: i64 = tensor
+        .call_method0("numel")
+        .and_then(|v| v.extract())
+        .unwrap_or(0);
+    if numel == 0 {
         return None;
     }
 
-    let tensor = outputs_list.get_item(0).ok()?;
-    let sr: u32 = sr_list
-        .downcast::<pyo3::types::PyList>()
-        .ok()?
-        .get_item(0)
-        .ok()?
-        .extract()
-        .ok()?;
+    // Get sample rate -- may be in "sr" as int, list, or tensor
+    let sr: u32 = (|| -> Option<u32> {
+        let sr_val = mm.get_item("sr").ok()?;
+        if let Ok(v) = sr_val.extract::<u32>() {
+            return Some(v);
+        }
+        if let Ok(list) = sr_val.downcast::<pyo3::types::PyList>() {
+            if let Ok(item) = list.get_item(0) {
+                if let Ok(v) = item.extract::<u32>() {
+                    return Some(v);
+                }
+                // Could be a tensor scalar
+                if let Ok(v) = item.call_method0("item") {
+                    return v.extract::<u32>().ok();
+                }
+            }
+        }
+        None
+    })()
+    .unwrap_or(24000);
 
+    // Convert tensor to float32 numpy bytes
     let np_array = tensor
         .call_method0("detach")
         .ok()?
@@ -260,10 +296,16 @@ pub fn extract_audio(
         .ok()?
         .call_method0("float")
         .ok()?
+        .call_method0("squeeze")
+        .ok()?
         .call_method0("numpy")
         .ok()?;
     let raw_bytes: Vec<u8> =
         np_array.call_method0("tobytes").ok()?.extract().ok()?;
+
+    if raw_bytes.is_empty() {
+        return None;
+    }
 
     Some((raw_bytes, sr))
 }

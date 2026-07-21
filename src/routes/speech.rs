@@ -136,10 +136,17 @@ async fn create_speech_full(
                             .getattr("final_output_type")
                             .and_then(|v| v.extract())
                             .unwrap_or_default();
-                        let has_mm = obj
+                        let mm = obj
                             .getattr("multimodal_output")
-                            .map(|v| !v.is_none())
+                            .ok();
+                        let has_mm = mm
+                            .as_ref()
+                            .map(|v| !v.is_none() && v.is_truthy().unwrap_or(false))
                             .unwrap_or(false);
+                        let mm_repr: String = mm
+                            .as_ref()
+                            .map(|v| format!("{}", v.repr().map(|r| r.to_string()).unwrap_or_default()))
+                            .unwrap_or_default();
                         let has_req = obj
                             .getattr("request_output")
                             .map(|v| !v.is_none())
@@ -148,8 +155,8 @@ async fn create_speech_full(
                         let audio = extract_audio(py, &output);
                         let debug = format!(
                             "yield#{yield_count}: type={out_type} finished={fin} \
-                             has_mm={has_mm} has_req_output={has_req} \
-                             audio_extracted={}",
+                             has_mm={has_mm} mm={mm_repr} \
+                             has_req_output={has_req} audio_extracted={}",
                             audio.is_some()
                         );
                         (audio, fin, debug)
