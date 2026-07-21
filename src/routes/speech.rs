@@ -100,7 +100,8 @@ pub async fn create_speech(
         None,
     ).await {
         Ok(Some(audio_opaque)) => {
-            match extract_audio_from_opaque(&audio_opaque, &response_format) {
+            debug!("Audio OpaqueValue: {:?}", audio_opaque);
+                match extract_audio_from_opaque(&audio_opaque, &response_format) {
                 Ok((audio_bytes, content_type)) => {
                     let mut headers = HeaderMap::new();
                     headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
