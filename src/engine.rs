@@ -163,17 +163,18 @@ impl OmniEngine {
 
     pub async fn anext(generator: &PyObject) -> Result<Option<PyObject>> {
         let locals = get_task_locals();
-        let coro = Python::with_gil(|py| -> PyResult<PyObject> {
-            generator.call_method0(py, "__anext__")
-        })?;
-        let result = Python::with_gil(|py| {
-            pyo3_async_runtimes::into_future_with_locals(
+
+        // Single GIL acquisition: get __anext__ coroutine and submit to event loop
+        let fut = Python::with_gil(|py| -> anyhow::Result<_> {
+            let coro = generator.call_method0(py, "__anext__")?;
+            let fut = pyo3_async_runtimes::into_future_with_locals(
                 &locals.clone_ref(py),
                 coro.into_bound(py),
-            )
-        })?
-        .await;
-        match result {
+            )?;
+            Ok(fut)
+        })?;
+
+        match fut.await {
             Ok(val) => Ok(Some(val)),
             Err(e) => Python::with_gil(|py| {
                 if e.is_instance_of::<PyStopAsyncIteration>(py) {
@@ -300,6 +301,24 @@ impl OmniEngine {
             Ok(())
         })
     }
+}
+
+/// Advance the generator and extract audio + finished status in one GIL acquisition.
+/// Returns None when the generator is exhausted.
+pub async fn anext_audio(
+    generator: &PyObject,
+) -> Result<Option<(Option<(Vec<u8>, u32)>, bool)>> {
+    let output = match OmniEngine::anext(generator).await? {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+
+    // Single GIL: extract audio + check finished
+    Ok(Some(Python::with_gil(|py| {
+        let audio = extract_audio(py, &output);
+        let finished = is_finished(py, &output);
+        (audio, finished)
+    })))
 }
 
 pub fn extract_audio(py: Python<'_>, output: &PyObject) -> Option<(Vec<u8>, u32)> {

@@ -17,7 +17,7 @@ use serde_json::Value;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::engine::{OmniEngine, extract_audio, is_finished};
+use crate::engine::{OmniEngine, anext_audio};
 use crate::server::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -98,11 +98,8 @@ async fn create_speech_full(state: AppState, req: SpeechRequest, request_id: Str
 
     let mut last_audio: Option<(Vec<u8>, u32)> = None;
     loop {
-        match OmniEngine::anext(&generator).await {
-            Ok(Some(output)) => {
-                let (audio, finished) = Python::with_gil(|py| {
-                    (extract_audio(py, &output), is_finished(py, &output))
-                });
+        match anext_audio(&generator).await {
+            Ok(Some((audio, finished))) => {
                 if audio.is_some() { last_audio = audio; }
                 if finished { break; }
             }
@@ -133,11 +130,8 @@ async fn create_speech_sse(state: AppState, req: SpeechRequest, request_id: Stri
 
     let stream = async_stream::stream! {
         loop {
-            match OmniEngine::anext(&generator).await {
-                Ok(Some(output)) => {
-                    let (audio, finished) = Python::with_gil(|py| {
-                        (extract_audio(py, &output), is_finished(py, &output))
-                    });
+            match anext_audio(&generator).await {
+                Ok(Some((audio, finished))) => {
                     if let Some((pcm_bytes, _)) = audio {
                         if !pcm_bytes.is_empty() {
                             let b64 = BASE64.encode(&pcm_bytes);
@@ -172,11 +166,8 @@ async fn create_speech_raw_stream(state: AppState, req: SpeechRequest, request_i
 
     let stream = async_stream::stream! {
         loop {
-            match OmniEngine::anext(&generator).await {
-                Ok(Some(output)) => {
-                    let (audio, finished) = Python::with_gil(|py| {
-                        (extract_audio(py, &output), is_finished(py, &output))
-                    });
+            match anext_audio(&generator).await {
+                Ok(Some((audio, finished))) => {
                     if let Some((pcm_bytes, _)) = audio {
                         if !pcm_bytes.is_empty() {
                             yield Ok::<_, std::io::Error>(bytes::Bytes::from(pcm_bytes));
@@ -239,16 +230,25 @@ fn start_generate(
         prompt.set_item("prompt_token_ids", pyo3::types::PyList::new(py, &ones)?)?;
         prompt.set_item("additional_information", &info)?;
 
-        // Sampling params coercion (still Python -- touches OmniSamplingParams objects)
+        // Sampling params: clone + set output_kind directly from Rust.
+        // RequestOutputKind: CUMULATIVE=0, DELTA=1, FINAL_ONLY=2
         let is_streaming = req.stream || req.stream_format.as_deref() == Some("sse");
-        let spl = py.import("copy")?.call_method1(
-            "deepcopy",
-            (engine.engine_ref(py).getattr("default_sampling_params_list")?,),
-        )?;
-        py.import("vllm_omni.entrypoints.utils")?.call_method1(
-            "coerce_param_message_types",
-            (&spl, is_streaming),
-        )?;
+        let target_kind: i32 = if is_streaming { 1 } else { 2 }; // DELTA or FINAL_ONLY
+        let copy = py.import("copy")?;
+        let default_spl = engine.engine_ref(py).getattr("default_sampling_params_list")?;
+        let spl = copy.call_method1("deepcopy", (&default_spl,))?;
+        let spl_list = spl.downcast::<pyo3::types::PyList>()?;
+        let sampling_params_cls = py.import("vllm.sampling_params")?
+            .getattr("SamplingParams")?;
+        for i in 0..spl_list.len() {
+            let sp = spl_list.get_item(i)?;
+            if sp.is_instance(&sampling_params_cls)? {
+                let clone = sp.call_method0("clone")?;
+                clone.setattr("output_kind", target_kind)?;
+                clone.setattr("skip_clone", true)?;
+                spl_list.set_item(i, clone)?;
+            }
+        }
 
         let kwargs = PyDict::new(py);
         kwargs.set_item("request_id", request_id)?;
