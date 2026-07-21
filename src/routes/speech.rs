@@ -51,25 +51,39 @@ pub async fn create_speech(
     let language = req.extra.get("language").and_then(|v| v.as_str()).unwrap_or("Auto");
     let speaker = req.voice.as_deref().unwrap_or("Vivian");
 
-    let mut info = serde_json::Map::new();
-    info.insert("text".into(), Value::Array(vec![Value::String(req.input.clone())]));
-    info.insert("task_type".into(), Value::Array(vec![Value::String(task_type.to_string())]));
-    info.insert("language".into(), Value::Array(vec![Value::String(language.to_string())]));
-    info.insert("speaker".into(), Value::Array(vec![Value::String(speaker.to_string())]));
+    // Build AdditionalInformationPayload format:
+    // { "entries": { "key": { "list_data": [values] }, ... } }
+    let mut entries = serde_json::Map::new();
+
+    let make_list_entry = |vals: Vec<Value>| -> Value {
+        let mut entry = serde_json::Map::new();
+        entry.insert("list_data".into(), Value::Array(vals));
+        // All other fields null
+        entry.insert("tensor_data".into(), Value::Null);
+        entry.insert("tensor_shape".into(), Value::Null);
+        entry.insert("tensor_dtype".into(), Value::Null);
+        entry.insert("scalar_data".into(), Value::Null);
+        Value::Object(entry)
+    };
+
+    entries.insert("text".into(), make_list_entry(vec![Value::String(req.input.clone())]));
+    entries.insert("task_type".into(), make_list_entry(vec![Value::String(task_type.to_string())]));
+    entries.insert("language".into(), make_list_entry(vec![Value::String(language.to_string())]));
+    entries.insert("speaker".into(), make_list_entry(vec![Value::String(speaker.to_string())]));
 
     if let Some(ref inst) = req.instructions {
-        info.insert("instruct".into(), Value::Array(vec![Value::String(inst.clone())]));
+        entries.insert("instruct".into(), make_list_entry(vec![Value::String(inst.clone())]));
     }
 
-    // Encode as msgpack OpaqueValue
-    let additional_info = match rmp_serde::to_vec_named(&info) {
-        Ok(bytes) => {
-            match rmp_serde::from_slice::<rmpv::Value>(&bytes) {
-                Ok(val) => OpaqueValue::from(val),
-                Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to encode info: {e}")),
-            }
-        }
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to serialize info: {e}")),
+    let mut payload = serde_json::Map::new();
+    payload.insert("entries".into(), Value::Object(entries));
+
+    let additional_info = match rmp_serde::to_vec_named(&payload) {
+        Ok(bytes) => match rmp_serde::from_slice::<rmpv::Value>(&bytes) {
+            Ok(val) => OpaqueValue::from(val),
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to encode: {e}")),
+        },
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to serialize: {e}")),
     };
 
     // Estimate prompt length (placeholder for now -- will use tokenizer)
