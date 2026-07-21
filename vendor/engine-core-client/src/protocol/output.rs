@@ -111,7 +111,7 @@ pub struct EngineCoreOutput {
     pub routed_experts: Option<OpaqueValue>,
     /// Number of NaNs seen in logits. Values above zero indicate corruption.
     #[serde(default)]
-    pub num_nans_in_logits: u32,
+    pub num_nans_in_logits: Option<u32>,
 
     // vllm-omni extension fields (positions 14-16)
     #[serde(default)]
