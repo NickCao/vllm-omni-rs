@@ -54,8 +54,6 @@ pub async fn spawn_stages(config: &StageSpawnConfig) -> Result<Vec<StageProcess>
             .arg("--omni-master-port")
             .arg(config.master_port.to_string());
 
-        // Enable async chunk so workers handle inter-stage codec transfer
-        // via SharedMemoryConnector without needing the orchestrator bridge
         cmd.arg("--async-chunk");
 
         for arg in &config.extra_args {
