@@ -124,6 +124,10 @@ pub struct EngineCoreRequest {
     /// standard `request_finished` hook.
     #[serde(default)]
     pub abort_immediately: bool,
+
+    // vllm-omni extension (position 20)
+    #[serde(default)]
+    pub additional_information: Option<OpaqueValue>,
 }
 
 impl EngineCoreRequest {

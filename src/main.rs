@@ -17,9 +17,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod master;
 mod routes;
+mod routing;
 mod server;
 mod stages;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -29,6 +31,7 @@ use tracing::info;
 use vllm_managed_engine::allocate_handshake_port;
 
 use crate::master::start_and_connect_stages;
+use crate::routing::TtsRouter;
 use crate::stages::{StageSpawnConfig, shutdown_stages, spawn_stages};
 
 #[derive(Parser)]
@@ -118,23 +121,32 @@ fn main() -> Result<()> {
             connected_stages.len()
         );
 
-        // TODO: Create a routing layer that uses connected_stages
-        // TODO: Wire HTTP routes to send requests via EngineCoreClient
+        // 4. Create TTS router
+        let router = Arc::new(TtsRouter::new(connected_stages)
+            .context("Failed to create TTS router")?);
 
-        // 4. Start HTTP server
+        // 5. Start HTTP server
+        let state = server::AppState {
+            model_name: cli.model.clone(),
+            router: Arc::clone(&router),
+        };
+        let app = server::build_router(state);
+
         let addr = format!("{}:{}", cli.host, cli.port);
         let listener = TcpListener::bind(&addr)
             .await
             .context(format!("Failed to bind to {addr}"))?;
         info!("Listening on {addr}");
 
-        // Wait for shutdown
-        shutdown_signal().await;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .context("Server error")?;
 
-        // 5. Cleanup
-        info!("Shutting down stages...");
-        for stage in connected_stages {
-            stage.client.shutdown();
+        // 6. Cleanup
+        info!("Shutting down...");
+        if let Ok(r) = Arc::try_unwrap(router) {
+            let _ = r.shutdown();
         }
         shutdown_stages(&mut stage_processes).await;
         info!("Goodbye.");
