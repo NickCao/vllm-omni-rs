@@ -294,7 +294,7 @@ fn estimate_prompt_len_py(
         "    spk_is_dialect=getattr(talker_config, 'spk_is_dialect', None),\n",
         ")\n",
     )).unwrap();
-    py.run(&code, None, Some(&locals))?;
+    py.run(&code, Some(&locals), Some(&locals))?;
 
     locals.get_item("result")?.unwrap().extract()
 }
