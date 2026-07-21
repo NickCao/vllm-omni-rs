@@ -67,8 +67,9 @@ struct Cli {
     #[arg(long)]
     tokenizer_path: Option<String>,
 
-    /// Extra CLI args passed to headless Python stages.
-    #[arg(long, num_args = 1..)]
+    /// Extra CLI args passed to headless Python stages (e.g.
+    /// --stage-args --gpu-memory-utilization 0.5).
+    #[arg(long, num_args = 1.., allow_hyphen_values = true)]
     stage_args: Vec<String>,
 }
 
