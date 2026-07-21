@@ -122,17 +122,39 @@ async fn create_speech_full(
         }
     };
 
-    // Iterate the async generator to collect the final output.
     let mut last_audio: Option<(Vec<u8>, u32)> = None;
+    let mut yield_count = 0u32;
 
     loop {
         match OmniEngine::anext(&generator).await {
             Ok(Some(output)) => {
-                let (audio, finished) = Python::with_gil(|py| {
-                    let audio = extract_audio(py, &output);
-                    let fin = is_finished(py, &output);
-                    (audio, fin)
-                });
+                yield_count += 1;
+                let (audio, finished, debug_info) =
+                    Python::with_gil(|py| {
+                        let obj = output.bind(py);
+                        let out_type: String = obj
+                            .getattr("final_output_type")
+                            .and_then(|v| v.extract())
+                            .unwrap_or_default();
+                        let has_mm = obj
+                            .getattr("multimodal_output")
+                            .map(|v| !v.is_none())
+                            .unwrap_or(false);
+                        let has_req = obj
+                            .getattr("request_output")
+                            .map(|v| !v.is_none())
+                            .unwrap_or(false);
+                        let fin = is_finished(py, &output);
+                        let audio = extract_audio(py, &output);
+                        let debug = format!(
+                            "yield#{yield_count}: type={out_type} finished={fin} \
+                             has_mm={has_mm} has_req_output={has_req} \
+                             audio_extracted={}",
+                            audio.is_some()
+                        );
+                        (audio, fin, debug)
+                    });
+                tracing::info!("{debug_info}");
                 if audio.is_some() {
                     last_audio = audio;
                 }
