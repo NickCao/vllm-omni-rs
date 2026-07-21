@@ -1,6 +1,5 @@
 //! POST /v1/audio/speech -- Qwen3 TTS endpoint.
 
-use std::ffi::CString;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -198,8 +197,8 @@ async fn create_speech_raw_stream(state: AppState, req: SpeechRequest, request_i
 
 /// Build TTS prompt and call engine.generate().
 ///
-/// Prompt building is in Rust. Only the prompt length estimation calls
-/// into Python (needs the model's tokenizer which has no tokenizer.json).
+/// Prompt building and length estimation are done in Rust (using vllm-tokenizer).
+/// Only generate() and sampling params coercion call into Python.
 fn start_generate(
     py: Python<'_>,
     engine: &OmniEngine,
@@ -207,7 +206,6 @@ fn start_generate(
     request_id: &str,
 ) -> anyhow::Result<PyObject> {
     (|| -> PyResult<PyObject> {
-        // Build additional_information
         let info = PyDict::new(py);
         info.set_item("text", pyo3::types::PyList::new(py, &[&req.input])?)?;
 
@@ -229,17 +227,19 @@ fn start_generate(
             }
         }
 
-        // Estimate prompt length via Python (the only Python call in prompt building).
-        // Uses the engine's already-loaded model config + Python tokenizer.
-        let prompt_len = estimate_prompt_len_py(py, engine, &info, task_type)?;
+        // Prompt length estimation -- pure Rust when tokenizer loaded
+        let prompt_len = engine.estimate_tts_prompt_len(
+            &req.input,
+            req.instructions.as_deref(),
+            task_type,
+        );
 
-        // Build prompt: {prompt_token_ids: [1]*N, additional_information: {...}}
         let ones: Vec<i64> = vec![1; prompt_len];
         let prompt = PyDict::new(py);
         prompt.set_item("prompt_token_ids", pyo3::types::PyList::new(py, &ones)?)?;
         prompt.set_item("additional_information", &info)?;
 
-        // Coerce sampling params: FINAL_ONLY for non-streaming, DELTA for streaming
+        // Sampling params coercion (still Python -- touches OmniSamplingParams objects)
         let is_streaming = req.stream || req.stream_format.as_deref() == Some("sse");
         let spl = py.import("copy")?.call_method1(
             "deepcopy",
@@ -259,44 +259,6 @@ fn start_generate(
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#}")))
     })()
     .map_err(|e: PyErr| anyhow::anyhow!("{e}"))
-}
-
-// unused function removed
-
-/// Call Python to estimate prompt length and return the result.
-fn estimate_prompt_len_py(
-    py: Python<'_>,
-    engine: &OmniEngine,
-    info: &Bound<'_, PyDict>,
-    task_type: &str,
-) -> PyResult<usize> {
-    let locals = PyDict::new(py);
-    locals.set_item("model_name", &engine.model_name)?;
-    locals.set_item("info", info)?;
-    locals.set_item("task_type", task_type)?;
-    locals.set_item("engine", engine.engine_ref(py))?;
-
-    let code = CString::new(concat!(
-        "import sys, types\n",
-        "from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import Qwen3TTSPromptEmbedsBuilder\n",
-        "if '_omni_rs_cache' not in sys.modules:\n",
-        "    from transformers import AutoTokenizer\n",
-        "    _m = types.ModuleType('_omni_rs_cache')\n",
-        "    _m.tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side='left')\n",
-        "    sys.modules['_omni_rs_cache'] = _m\n",
-        "_tok = sys.modules['_omni_rs_cache'].tok\n",
-        "talker_config = engine.model_config.hf_config.talker_config\n",
-        "result = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(\n",
-        "    additional_information=dict(info),\n",
-        "    task_type=task_type,\n",
-        "    tokenize_prompt=lambda t: _tok(t, padding=False)['input_ids'],\n",
-        "    codec_language_id=getattr(talker_config, 'codec_language_id', None),\n",
-        "    spk_is_dialect=getattr(talker_config, 'spk_is_dialect', None),\n",
-        ")\n",
-    )).unwrap();
-    py.run(&code, Some(&locals), Some(&locals))?;
-
-    locals.get_item("result")?.unwrap().extract()
 }
 
 fn encode_audio(pcm_f32_bytes: &[u8], sample_rate: u32, format: &str) -> (Vec<u8>, &'static str) {
