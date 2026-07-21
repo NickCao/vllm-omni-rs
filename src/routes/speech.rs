@@ -1,9 +1,6 @@
 //! POST /v1/audio/speech -- Qwen3 TTS endpoint.
-//!
-//! Supports two response modes:
-//! - Non-streaming: returns complete audio as raw bytes (audio/wav, audio/pcm, etc.)
-//! - SSE streaming: returns base64-encoded PCM chunks as SSE events
 
+use std::ffi::CString;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -72,19 +69,9 @@ pub async fn create_speech(
     if let Some(ref voice) = req.voice {
         if !state.engine.supported_speakers.is_empty() {
             let voice_lower = voice.to_lowercase();
-            if !state
-                .engine
-                .supported_speakers
-                .iter()
-                .any(|s| s.to_lowercase() == voice_lower)
-            {
+            if !state.engine.supported_speakers.iter().any(|s| s.to_lowercase() == voice_lower) {
                 let valid = state.engine.supported_speakers.join(", ");
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    &format!(
-                        "Invalid voice '{voice}'. Supported: {valid}"
-                    ),
-                );
+                return error_response(StatusCode::BAD_REQUEST, &format!("Invalid voice '{voice}'. Supported: {valid}"));
             }
         }
     }
@@ -101,51 +88,29 @@ pub async fn create_speech(
     }
 }
 
-/// Non-streaming: collect all audio, encode, return as single response.
-async fn create_speech_full(
-    state: AppState,
-    req: SpeechRequest,
-    request_id: String,
-) -> Response {
+async fn create_speech_full(state: AppState, req: SpeechRequest, request_id: String) -> Response {
     let engine = Arc::clone(&state.engine);
     let response_format = req.response_format.clone();
 
-    let generator = match Python::with_gil(|py| {
-        start_generate(py, &engine, &req, &request_id)
-    }) {
+    let generator = match Python::with_gil(|py| start_generate(py, &engine, &req, &request_id)) {
         Ok(g) => g,
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("{e:#}"),
-            )
-        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
     };
 
     let mut last_audio: Option<(Vec<u8>, u32)> = None;
-
     loop {
         match OmniEngine::anext(&generator).await {
             Ok(Some(output)) => {
                 let (audio, finished) = Python::with_gil(|py| {
-                    let audio = extract_audio(py, &output);
-                    let fin = is_finished(py, &output);
-                    (audio, fin)
+                    (extract_audio(py, &output), is_finished(py, &output))
                 });
-                if audio.is_some() {
-                    last_audio = audio;
-                }
-                if finished {
-                    break;
-                }
+                if audio.is_some() { last_audio = audio; }
+                if finished { break; }
             }
             Ok(None) => break,
             Err(e) => {
                 error!("generate error: {e:#}");
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("{e:#}"),
-                );
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}"));
             }
         }
     }
@@ -154,32 +119,17 @@ async fn create_speech_full(
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "No audio output");
     };
 
-    let (encoded, content_type) =
-        encode_audio(&pcm_bytes, sample_rate, &response_format);
-
+    let (encoded, content_type) = encode_audio(&pcm_bytes, sample_rate, &response_format);
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
     (headers, encoded).into_response()
 }
 
-/// SSE streaming: send base64 PCM chunks as events.
-async fn create_speech_sse(
-    state: AppState,
-    req: SpeechRequest,
-    request_id: String,
-) -> Response {
+async fn create_speech_sse(state: AppState, req: SpeechRequest, request_id: String) -> Response {
     let engine = Arc::clone(&state.engine);
-
-    let generator = match Python::with_gil(|py| {
-        start_generate(py, &engine, &req, &request_id)
-    }) {
+    let generator = match Python::with_gil(|py| start_generate(py, &engine, &req, &request_id)) {
         Ok(g) => g,
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("{e:#}"),
-            )
-        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
     };
 
     let stream = async_stream::stream! {
@@ -187,81 +137,38 @@ async fn create_speech_sse(
             match OmniEngine::anext(&generator).await {
                 Ok(Some(output)) => {
                     let (audio, finished) = Python::with_gil(|py| {
-                        let audio = extract_audio(py, &output);
-                        let fin = is_finished(py, &output);
-                        (audio, fin)
+                        (extract_audio(py, &output), is_finished(py, &output))
                     });
-
-                    if let Some((pcm_bytes, _sr)) = audio {
+                    if let Some((pcm_bytes, _)) = audio {
                         if !pcm_bytes.is_empty() {
                             let b64 = BASE64.encode(&pcm_bytes);
-                            let delta = SseAudioDelta {
-                                event_type: "speech.audio.delta",
-                                audio: b64,
-                                response_format: "pcm",
-                            };
-                            yield Ok::<_, std::convert::Infallible>(
-                                Event::default()
-                                    .event("speech.audio.delta")
-                                    .json_data(&delta)
-                                    .unwrap()
-                            );
+                            let delta = SseAudioDelta { event_type: "speech.audio.delta", audio: b64, response_format: "pcm" };
+                            yield Ok::<_, std::convert::Infallible>(Event::default().event("speech.audio.delta").json_data(&delta).unwrap());
                         }
                     }
-
                     if finished {
-                        let done = SseAudioDone {
-                            event_type: "speech.audio.done",
-                        };
-                        yield Ok(
-                            Event::default()
-                                .event("speech.audio.done")
-                                .json_data(&done)
-                                .unwrap()
-                        );
+                        let done = SseAudioDone { event_type: "speech.audio.done" };
+                        yield Ok(Event::default().event("speech.audio.done").json_data(&done).unwrap());
                         break;
                     }
                 }
                 Ok(None) => break,
                 Err(e) => {
                     error!("generate error: {e:#}");
-                    let err = serde_json::json!({
-                        "type": "speech.audio.error",
-                        "error": {"message": format!("{e:#}")}
-                    });
-                    yield Ok(Event::default()
-                        .event("speech.audio.error")
-                        .json_data(&err)
-                        .unwrap());
+                    yield Ok(Event::default().event("speech.audio.error").json_data(&serde_json::json!({"type":"speech.audio.error","error":{"message":format!("{e:#}")}})).unwrap());
                     break;
                 }
             }
         }
     };
-
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
 }
 
-/// Raw audio streaming: send audio bytes directly.
-async fn create_speech_raw_stream(
-    state: AppState,
-    req: SpeechRequest,
-    request_id: String,
-) -> Response {
+async fn create_speech_raw_stream(state: AppState, req: SpeechRequest, request_id: String) -> Response {
     let engine = Arc::clone(&state.engine);
-
-    let generator = match Python::with_gil(|py| {
-        start_generate(py, &engine, &req, &request_id)
-    }) {
+    let generator = match Python::with_gil(|py| start_generate(py, &engine, &req, &request_id)) {
         Ok(g) => g,
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("{e:#}"),
-            )
-        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
     };
 
     let stream = async_stream::stream! {
@@ -269,155 +176,139 @@ async fn create_speech_raw_stream(
             match OmniEngine::anext(&generator).await {
                 Ok(Some(output)) => {
                     let (audio, finished) = Python::with_gil(|py| {
-                        let audio = extract_audio(py, &output);
-                        let fin = is_finished(py, &output);
-                        (audio, fin)
+                        (extract_audio(py, &output), is_finished(py, &output))
                     });
-                    if let Some((pcm_bytes, _sr)) = audio {
+                    if let Some((pcm_bytes, _)) = audio {
                         if !pcm_bytes.is_empty() {
                             yield Ok::<_, std::io::Error>(bytes::Bytes::from(pcm_bytes));
                         }
                     }
-                    if finished {
-                        break;
-                    }
+                    if finished { break; }
                 }
                 Ok(None) => break,
-                Err(e) => {
-                    error!("raw stream error: {e:#}");
-                    break;
-                }
+                Err(e) => { error!("raw stream error: {e:#}"); break; }
             }
         }
     };
-
     let body = axum::body::Body::from_stream(stream);
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, "audio/pcm".parse().unwrap());
     (headers, body).into_response()
 }
 
-/// Build the Qwen3-TTS prompt and call engine.generate().
+/// Build TTS prompt and call engine.generate().
 ///
-/// The prompt format is:
-///   prompt_token_ids: [1] * estimated_len  (placeholders)
-///   additional_information: {text, task_type, language, speaker, ...}
+/// Prompt building is in Rust. Only the prompt length estimation calls
+/// into Python (needs the model's tokenizer which has no tokenizer.json).
 fn start_generate(
     py: Python<'_>,
     engine: &OmniEngine,
     req: &SpeechRequest,
     request_id: &str,
 ) -> anyhow::Result<PyObject> {
-    let additional_info = PyDict::new(py);
-    additional_info.set_item(
-        "text",
-        pyo3::types::PyList::new(py, &[&req.input])?,
-    )?;
+    (|| -> PyResult<PyObject> {
+        // Build additional_information
+        let info = PyDict::new(py);
+        info.set_item("text", pyo3::types::PyList::new(py, &[&req.input])?)?;
 
-    let task_type = req
-        .extra
-        .get("task_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("CustomVoice");
-    additional_info.set_item(
-        "task_type",
-        pyo3::types::PyList::new(py, &[task_type])?,
-    )?;
+        let task_type = req.extra.get("task_type").and_then(|v| v.as_str()).unwrap_or("CustomVoice");
+        info.set_item("task_type", pyo3::types::PyList::new(py, &[task_type])?)?;
 
-    let language = req
-        .extra
-        .get("language")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Auto");
-    additional_info.set_item(
-        "language",
-        pyo3::types::PyList::new(py, &[language])?,
-    )?;
+        let language = req.extra.get("language").and_then(|v| v.as_str()).unwrap_or("Auto");
+        info.set_item("language", pyo3::types::PyList::new(py, &[language])?)?;
 
-    let speaker = req.voice.as_deref().unwrap_or("Chelsie");
-    additional_info.set_item(
-        "speaker",
-        pyo3::types::PyList::new(py, &[speaker])?,
-    )?;
+        let speaker = req.voice.as_deref().unwrap_or("Vivian");
+        info.set_item("speaker", pyo3::types::PyList::new(py, &[speaker])?)?;
 
-    if let Some(ref instructions) = req.instructions {
-        additional_info.set_item(
-            "instruct",
-            pyo3::types::PyList::new(py, &[instructions.as_str()])?,
-        )?;
-    }
-
-    // Pass any extra fields into additional_information.
-    for (k, v) in &req.extra {
-        if matches!(k.as_str(), "task_type" | "language") {
-            continue;
+        if let Some(ref inst) = req.instructions {
+            info.set_item("instruct", pyo3::types::PyList::new(py, &[inst.as_str()])?)?;
         }
-        let py_v = pythonize::pythonize(py, v)?;
-        additional_info.set_item(k, py_v)?;
-    }
+        for (k, v) in &req.extra {
+            if !matches!(k.as_str(), "task_type" | "language") {
+                info.set_item(k, pythonize::pythonize(py, v)?)?;
+            }
+        }
 
-    // Build prompt with placeholder token IDs.
-    // The model replaces these with computed embeddings at forward time.
-    let placeholder_len = engine.estimate_tts_prompt_len(
-        &req.input,
-        req.instructions.as_deref(),
-    );
-    let ones: Vec<i64> = vec![1; placeholder_len];
-    let prompt_token_ids = pyo3::types::PyList::new(py, &ones)?;
+        // Estimate prompt length via Python (the only Python call in prompt building).
+        // Uses the engine's already-loaded model config + Python tokenizer.
+        let prompt_len = estimate_prompt_len_py(py, engine, &info, task_type)?;
 
-    let prompt = PyDict::new(py);
-    prompt.set_item("prompt_token_ids", prompt_token_ids)?;
-    prompt.set_item("additional_information", additional_info)?;
+        // Build prompt: {prompt_token_ids: [1]*N, additional_information: {...}}
+        let ones: Vec<i64> = vec![1; prompt_len];
+        let prompt = PyDict::new(py);
+        prompt.set_item("prompt_token_ids", pyo3::types::PyList::new(py, &ones)?)?;
+        prompt.set_item("additional_information", &info)?;
 
-    // Get default sampling params and coerce to FINAL_ONLY for non-streaming.
-    // This matches Python's coerce_param_message_types(spl, is_streaming=False)
-    // which sets output_kind=FINAL_ONLY so the engine yields the complete
-    // waveform instead of incremental deltas.
-    let is_streaming = req.stream || req.stream_format.as_deref() == Some("sse");
-    let spl_list = (|| -> PyResult<Bound<'_, pyo3::types::PyList>> {
-        let utils = py.import("vllm_omni.entrypoints.utils")?;
-        let engine_obj = engine.engine_ref(py);
-        let default_spl = engine_obj.getattr("default_sampling_params_list")?;
-        let spl_copy = py.import("copy")?.call_method1("deepcopy", (&default_spl,))?;
-        let spl_list = spl_copy.downcast_into::<pyo3::types::PyList>()?;
-        utils.call_method1(
-            "coerce_param_message_types",
-            (&spl_list, is_streaming),
+        // Coerce sampling params: FINAL_ONLY for non-streaming, DELTA for streaming
+        let is_streaming = req.stream || req.stream_format.as_deref() == Some("sse");
+        let spl = py.import("copy")?.call_method1(
+            "deepcopy",
+            (engine.engine_ref(py).getattr("default_sampling_params_list")?,),
         )?;
-        Ok(spl_list)
+        py.import("vllm_omni.entrypoints.utils")?.call_method1(
+            "coerce_param_message_types",
+            (&spl, is_streaming),
+        )?;
+
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("request_id", request_id)?;
+        kwargs.set_item("output_modalities", pyo3::types::PyList::new(py, &["audio"])?)?;
+        kwargs.set_item("sampling_params_list", &spl)?;
+
+        engine.generate(py, &prompt, &kwargs)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#}")))
     })()
-    .map_err(|e| anyhow::anyhow!("Failed to prepare sampling params: {e}"))?;
-
-    let kwargs = PyDict::new(py);
-    kwargs.set_item("request_id", request_id)?;
-    kwargs.set_item(
-        "output_modalities",
-        pyo3::types::PyList::new(py, &[&"audio"])?,
-    )?;
-    kwargs.set_item("sampling_params_list", spl_list)?;
-
-    engine.generate(py, &prompt, &kwargs)
+    .map_err(|e: PyErr| anyhow::anyhow!("{e}"))
 }
 
-/// Encode float32 PCM bytes into the requested format.
-///
-/// pcm_bytes is raw float32 LE samples. We convert to 16-bit PCM for WAV/PCM.
+// unused function removed
+
+/// Call Python to estimate prompt length and return the result.
+fn estimate_prompt_len_py(
+    py: Python<'_>,
+    engine: &OmniEngine,
+    info: &Bound<'_, PyDict>,
+    task_type: &str,
+) -> PyResult<usize> {
+    let locals = PyDict::new(py);
+    locals.set_item("model_name", &engine.model_name)?;
+    locals.set_item("info", info)?;
+    locals.set_item("task_type", task_type)?;
+    locals.set_item("engine", engine.engine_ref(py))?;
+
+    let code = CString::new(r#"
+import sys
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import Qwen3TTSPromptEmbedsBuilder
+
+_cache = sys.modules.setdefault('_omni_rs_cache', type(sys)('_omni_rs_cache'))
+if not hasattr(_cache, 'tok'):
+    from transformers import AutoTokenizer
+    _cache.tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side='left')
+
+talker_config = engine.model_config.hf_config.talker_config
+result = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
+    additional_information=dict(info),
+    task_type=task_type,
+    tokenize_prompt=lambda t: _cache.tok(t, padding=False)['input_ids'],
+    codec_language_id=getattr(talker_config, 'codec_language_id', None),
+    spk_is_dialect=getattr(talker_config, 'spk_is_dialect', None),
+)
+"#).unwrap();
+    py.run(&code, None, Some(&locals))?;
+
+    locals.get_item("result")?.unwrap().extract()
+}
+
 fn encode_audio(pcm_f32_bytes: &[u8], sample_rate: u32, format: &str) -> (Vec<u8>, &'static str) {
     let samples_f32: &[f32] = bytemuck::cast_slice(pcm_f32_bytes);
     let samples_i16: Vec<i16> = samples_f32
         .iter()
-        .map(|&s| {
-            let clamped = s.clamp(-1.0, 1.0);
-            (clamped * 32767.0) as i16
-        })
+        .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
         .collect();
 
     match format {
         "pcm" => {
-            let bytes: Vec<u8> = samples_i16
-                .iter()
-                .flat_map(|s| s.to_le_bytes())
-                .collect();
+            let bytes: Vec<u8> = samples_i16.iter().flat_map(|s| s.to_le_bytes()).collect();
             (bytes, "audio/pcm")
         }
         _ => {
@@ -429,9 +320,7 @@ fn encode_audio(pcm_f32_bytes: &[u8], sample_rate: u32, format: &str) -> (Vec<u8
                 sample_format: hound::SampleFormat::Int,
             };
             let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
-            for &s in &samples_i16 {
-                writer.write_sample(s).unwrap();
-            }
+            for &s in &samples_i16 { writer.write_sample(s).unwrap(); }
             writer.finalize().unwrap();
             (cursor.into_inner(), "audio/wav")
         }
@@ -439,11 +328,5 @@ fn encode_audio(pcm_f32_bytes: &[u8], sample_rate: u32, format: &str) -> (Vec<u8
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
-    (
-        status,
-        Json(serde_json::json!({
-            "error": {"message": message, "type": "server_error"}
-        })),
-    )
-        .into_response()
+    (status, Json(serde_json::json!({"error": {"message": message, "type": "server_error"}}))).into_response()
 }
