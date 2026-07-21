@@ -4,6 +4,7 @@
 //! via SharedMemoryConnector. This router submits requests to both stages
 //! and collects audio from stage 1.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
@@ -16,16 +17,27 @@ use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 use vllm_tokenizer::{HuggingFaceTokenizer, Tokenizer};
 
+use crate::introspect::StageSamplingDefaults;
 use crate::master::ConnectedStage;
+
+// EngineCoreOutput.output_kind wire values.
+const OUTPUT_KIND_DELTA: u8 = 1;
+const OUTPUT_KIND_FINAL_ONLY: u8 = 2;
 
 pub struct TtsRouter {
     stage0: EngineCoreClient,
     stage1: EngineCoreClient,
     tokenizer: HuggingFaceTokenizer,
+    stage0_sampling: EngineCoreSamplingParams,
+    stage1_sampling: EngineCoreSamplingParams,
 }
 
 impl TtsRouter {
-    pub fn new(stages: Vec<ConnectedStage>, tokenizer_path: &str) -> Result<Self> {
+    pub fn new(
+        stages: Vec<ConnectedStage>,
+        tokenizer_path: &str,
+        stage_sampling_defaults: &HashMap<u32, StageSamplingDefaults>,
+    ) -> Result<Self> {
         if stages.len() != 2 {
             bail!("TTS requires 2 stages, got {}", stages.len());
         }
@@ -43,10 +55,29 @@ impl TtsRouter {
             .context(format!("Failed to load tokenizer from {tokenizer_path}"))?;
         info!("Tokenizer loaded from {tokenizer_path}");
 
+        // Stage 0 (talker) only needs the total token count once it's done,
+        // so FINAL_ONLY avoids per-step deltas we'd discard anyway. Stage 1
+        // (code2wav) streams audio incrementally, so its output must be
+        // DELTA for generate_speech's chunk accumulation to see each new
+        // slice. This is a choice about how *we* consume the stream, not
+        // part of the model's own config, so it's applied here rather than
+        // looked up from stage_sampling_defaults.
+        let empty = StageSamplingDefaults::default();
+        let stage0_sampling = stage_sampling_defaults
+            .get(&0)
+            .unwrap_or(&empty)
+            .to_sampling_params(OUTPUT_KIND_FINAL_ONLY);
+        let stage1_sampling = stage_sampling_defaults
+            .get(&1)
+            .unwrap_or(&empty)
+            .to_sampling_params(OUTPUT_KIND_DELTA);
+
         Ok(Self {
             stage0: stage0.context("Stage 0 not found")?,
             stage1: stage1.context("Stage 1 not found")?,
             tokenizer,
+            stage0_sampling,
+            stage1_sampling,
         })
     }
 
@@ -65,7 +96,7 @@ impl TtsRouter {
         let stage0_req = EngineCoreRequest {
             request_id: request_id.to_string(),
             prompt_token_ids: Some(prompt_token_ids),
-            sampling_params: Some(default_tts_sampling_params()),
+            sampling_params: Some(self.stage0_sampling.clone()),
             arrival_time: now_secs(),
             additional_information: Some(additional_info.clone()),
             external_req_id: Some(request_id.to_string()),
@@ -88,7 +119,7 @@ impl TtsRouter {
         let stage1_req = EngineCoreRequest {
             request_id: request_id.to_string(),
             prompt_token_ids: Some(vec![0; stage1_prompt_len]),
-            sampling_params: Some(default_code2wav_sampling_params()),
+            sampling_params: Some(self.stage1_sampling.clone()),
             arrival_time: now_secs(),
             additional_information: Some(additional_info),
             external_req_id: Some(request_id.to_string()),
@@ -164,30 +195,6 @@ impl TtsRouter {
             let _ = self.stage1.shutdown().await;
         });
         Ok(())
-    }
-}
-
-fn default_tts_sampling_params() -> EngineCoreSamplingParams {
-    EngineCoreSamplingParams {
-        temperature: 0.9,
-        top_p: 1.0,
-        top_k: 50,
-        repetition_penalty: 1.05,
-        max_tokens: 4096,
-        min_tokens: 2,
-        stop_token_ids: vec![2150],
-        all_stop_token_ids: [2150].into(),
-        output_kind: 2, // FINAL_ONLY
-        ..Default::default()
-    }
-}
-
-fn default_code2wav_sampling_params() -> EngineCoreSamplingParams {
-    EngineCoreSamplingParams {
-        temperature: 0.0, // greedy for vocoder
-        max_tokens: 65536,
-        output_kind: 1, // DELTA -- matches Python's coerce for streaming
-        ..Default::default()
     }
 }
 

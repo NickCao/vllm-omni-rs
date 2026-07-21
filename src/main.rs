@@ -15,6 +15,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod introspect;
 mod master;
 mod routes;
 mod routing;
@@ -24,45 +25,16 @@ mod stages;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::info;
 use vllm_managed_engine::allocate_handshake_port;
 
+use crate::introspect::{extract_tokenizer, introspect_stage_sampling_params};
 use crate::master::start_and_connect_stages;
 use crate::routing::TtsRouter;
 use crate::stages::{StageSpawnConfig, shutdown_stages, spawn_stages};
-
-/// Extract tokenizer.json from the model using a one-time Python call.
-/// The HF repo doesn't ship tokenizer.json but the Python tokenizer
-/// builds one from vocab.json + merges.txt.
-fn extract_tokenizer(model: &str) -> Result<String> {
-    let path = format!(
-        "/tmp/_vllm_omni_rs_tokenizer_{}.json",
-        model.replace('/', "_")
-    );
-    if std::path::Path::new(&path).exists() {
-        info!("Using cached tokenizer: {path}");
-        return Ok(path);
-    }
-    // model/path are passed as argv, not interpolated into the script, so
-    // neither can break out of the Python string literal they'd otherwise sit in.
-    const SCRIPT: &str = "import sys; \
-        from transformers import AutoTokenizer; \
-        t = AutoTokenizer.from_pretrained(sys.argv[1], trust_remote_code=True); \
-        t.backend_tokenizer.save(sys.argv[2])";
-    let output = std::process::Command::new("python3")
-        .args(["-c", SCRIPT, model, &path])
-        .output()
-        .context("failed to run python3 for tokenizer extraction")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("tokenizer extraction failed: {stderr}");
-    }
-    info!("Extracted tokenizer to {path}");
-    Ok(path)
-}
 
 #[derive(Parser)]
 #[command(name = "vllm-omni-rs", about = "Rust HTTP frontend for vllm-omni TTS")]
@@ -157,8 +129,10 @@ fn main() -> Result<()> {
             None => extract_tokenizer(&cli.model)
                 .context("No --tokenizer-path given and auto-extraction failed")?,
         };
+        let stage_sampling_defaults = introspect_stage_sampling_params(&cli.model)
+            .context("Failed to introspect per-stage sampling defaults")?;
         let router = Arc::new(
-            TtsRouter::new(connected_stages, &tokenizer_path)
+            TtsRouter::new(connected_stages, &tokenizer_path, &stage_sampling_defaults)
                 .context("Failed to create TTS router")?,
         );
 
