@@ -1,0 +1,40 @@
+[package]
+name = "vllm-omni-rs"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Rust HTTP frontend for vllm-omni, calling into AsyncOmniEngine via PyO3"
+
+[[bin]]
+name = "vllm-omni-rs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.8"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+hound = "3"
+hyper = { version = "1", features = ["http1", "server"] }
+mimalloc = "0.1"
+pyo3 = { version = "0.25", features = ["auto-initialize"] }
+pyo3-async-runtimes = { version = "0.25", features = ["tokio-runtime"] }
+pythonize = "0.25"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+async-stream = "0.3"
+base64 = "0.22"
+bytemuck = { version = "1", features = ["extern_crate_alloc"] }
+num_cpus = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+tokio-stream = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+lto = "thin"
+panic = "abort"
