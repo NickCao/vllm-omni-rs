@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use std::any::type_name;
 use std::fmt;
 use std::str::FromStr;

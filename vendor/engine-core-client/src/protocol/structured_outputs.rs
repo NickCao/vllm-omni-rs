@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use enum_as_inner::EnumAsInner;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;

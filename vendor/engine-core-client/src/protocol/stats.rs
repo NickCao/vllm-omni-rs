@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -103,9 +100,6 @@ pub struct PrefillStats {
     /// Tokens to be prefilled from external KV transfer.
     #[serde(default)]
     pub num_external_cached_tokens: u32,
-    /// Prompt tokens newly admitted into the local prefix cache.
-    #[serde(default)]
-    pub num_cache_creation_tokens: u32,
 }
 
 /// Stats for debugging the metrics calculation.

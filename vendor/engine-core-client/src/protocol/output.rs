@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use std::collections::BTreeSet;
 
 use enum_as_inner::EnumAsInner;
@@ -100,24 +97,25 @@ pub struct EngineCoreOutput {
     #[serde(default)]
     pub kv_transfer_params: Option<serde_json::Value>,
     #[serde(default)]
-    pub ec_transfer_params: Option<serde_json::Value>,
-    #[serde(default)]
     pub trace_headers: Option<OpaqueValue>,
     /// Breakdown of the scheduled prefill computation, set on the first output
     /// of a newly scheduled prefill and elided for subsequent decode outputs.
     #[serde(default)]
-    pub prefill_stats: Option<OpaqueValue>,
+    pub prefill_stats: Option<PrefillStats>,
     #[serde(default)]
     pub routed_experts: Option<OpaqueValue>,
     /// Number of NaNs seen in logits. Values above zero indicate corruption.
     #[serde(default)]
-    pub num_nans_in_logits: Option<u32>,
+    pub num_nans_in_logits: u32,
 
-    // vllm-omni extension fields (positions 14-16)
+    // vllm-omni extension fields (positions 13-15)
+    /// Multimodal output tensors (audio, image, etc.)
     #[serde(default)]
     pub multimodal_output: Option<OpaqueValue>,
+    /// Whether the current segment is finished (for streaming TTS)
     #[serde(default)]
     pub is_segment_finished: Option<bool>,
+    /// Snapshot of new prompt length
     #[serde(default)]
     pub new_prompt_len_snapshot: Option<u32>,
 }
@@ -156,7 +154,7 @@ struct WireEngineCoreOutputs {
     #[serde(default)]
     outputs: Vec<EngineCoreOutput>,
     #[serde(default)]
-    scheduler_stats: Option<OpaqueValue>,
+    scheduler_stats: Option<Box<SchedulerStats>>,
     #[serde(default)]
     timestamp: f64,
     #[serde(default)]
@@ -184,7 +182,7 @@ pub enum DpControlMessage {
 pub struct RequestBatchOutputs {
     pub engine_index: u32,
     pub outputs: Vec<EngineCoreOutput>,
-    pub scheduler_stats: Option<OpaqueValue>,
+    pub scheduler_stats: Option<Box<SchedulerStats>>,
     pub timestamp: f64,
     pub finished_requests: Option<BTreeSet<String>>,
 }
@@ -387,7 +385,6 @@ mod tests {
                 stop_reason: Some(StopReason::Text("stop".to_string())),
                 events: None,
                 kv_transfer_params: None,
-                ec_transfer_params: None,
                 trace_headers: None,
                 prefill_stats: None,
                 routed_experts: None,
@@ -440,7 +437,6 @@ mod tests {
                             stop_reason: None,
                             events: None,
                             kv_transfer_params: None,
-                            ec_transfer_params: None,
                             trace_headers: None,
                             prefill_stats: None,
                             routed_experts: None,

@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use std::collections::{BTreeMap, HashMap};
 
 use bytes::Bytes;
@@ -126,6 +123,7 @@ pub struct EngineCoreRequest {
     pub abort_immediately: bool,
 
     // vllm-omni extension (position 20)
+    /// Additional information payload for omni models.
     #[serde(default)]
     pub additional_information: Option<OpaqueValue>,
 }

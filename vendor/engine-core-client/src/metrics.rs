@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};

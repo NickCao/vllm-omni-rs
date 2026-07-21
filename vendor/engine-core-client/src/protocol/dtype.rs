@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use serde::{Deserialize, Serialize};
 
 /// Effective model dtype reported by the engine after config resolution.
