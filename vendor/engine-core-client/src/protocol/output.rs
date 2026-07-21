@@ -106,7 +106,7 @@ pub struct EngineCoreOutput {
     /// Breakdown of the scheduled prefill computation, set on the first output
     /// of a newly scheduled prefill and elided for subsequent decode outputs.
     #[serde(default)]
-    pub prefill_stats: Option<PrefillStats>,
+    pub prefill_stats: Option<OpaqueValue>,
     #[serde(default)]
     pub routed_experts: Option<OpaqueValue>,
     /// Number of NaNs seen in logits. Values above zero indicate corruption.
