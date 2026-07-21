@@ -78,9 +78,12 @@ impl TtsRouter {
         let mut stream0 = self.stage0.call(stage0_req).await
             .context("Stage 0 call failed")?;
 
-        // Submit stage 1 (code2wav) immediately with a large placeholder.
-        // The worker waits for codec chunks from stage 0 via the connector.
-        let stage1_prompt_len = 4096 * 16; // large enough for any utterance
+        // Submit stage 1 (code2wav) with a minimal placeholder.
+        // Python's _prewarm_async_chunk_stages uses
+        // compute_talker_prompt_ids_length(stage0_prompt) which returns 1
+        // for placeholder prompts. The actual codec data arrives via the
+        // connector and the scheduler dynamically extends the request.
+        let stage1_prompt_len = 1usize;
         let stage1_req = EngineCoreRequest {
             request_id: request_id.to_string(),
             prompt_token_ids: Some(vec![0; stage1_prompt_len]),
@@ -88,6 +91,7 @@ impl TtsRouter {
             arrival_time: now_secs(),
             additional_information: Some(additional_info),
             external_req_id: Some(request_id.to_string()),
+            resumable: true, // async_chunk streaming input
             ..Default::default()
         };
 
