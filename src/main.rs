@@ -57,6 +57,7 @@ fn main() -> Result<()> {
     );
 
     pyo3::prepare_freethreaded_python();
+    engine::init_python_event_loop().context("Failed to init Python event loop")?;
 
     let extra_kwargs: serde_json::Map<String, serde_json::Value> =
         if let Some(ref json_str) = cli.engine_kwargs {

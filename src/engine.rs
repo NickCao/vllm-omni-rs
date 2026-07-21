@@ -1,40 +1,79 @@
 //! PyO3 bridge to vllm-omni's AsyncOmni.
 //!
-//! Calls AsyncOmni.generate() -- a Python async generator -- directly from
-//! Rust via pyo3-async-runtimes. The GIL is acquired only when interacting
-//! with Python objects; the actual orchestration runs in Python background
-//! threads with the GIL released.
+//! Creates a Python asyncio event loop in a background thread and stores
+//! it as TaskLocals. All async Python calls go through this event loop
+//! via `into_future_with_locals`.
 
+use std::sync::OnceLock;
+use std::thread;
 
 use anyhow::{Context, Result};
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use pyo3_async_runtimes::TaskLocals;
 use tracing::info;
 
+static TASK_LOCALS: OnceLock<TaskLocals> = OnceLock::new();
+
+/// Start a Python asyncio event loop in a background thread and store
+/// the TaskLocals for use by `anext()`.
+pub fn init_python_event_loop() -> Result<()> {
+    let locals = Python::with_gil(|py| -> PyResult<TaskLocals> {
+        let asyncio = py.import("asyncio")?;
+        let event_loop = asyncio.call_method0("new_event_loop")?;
+
+        let locals =
+            TaskLocals::new(event_loop.clone()).copy_context(py)?;
+
+        let loop_ref = event_loop.unbind();
+        thread::spawn(move || {
+            Python::with_gil(|py| {
+                let event_loop = loop_ref.bind(py);
+                if let Err(e) = event_loop.call_method0("run_forever") {
+                    e.print(py);
+                }
+            });
+        });
+
+        Ok(locals)
+    })
+    .context("Failed to create Python event loop")?;
+
+    TASK_LOCALS
+        .set(locals)
+        .map_err(|_| anyhow::anyhow!("Python event loop already initialized"))?;
+
+    info!("Python asyncio event loop started in background thread");
+    Ok(())
+}
+
+fn get_task_locals() -> &'static TaskLocals {
+    TASK_LOCALS
+        .get()
+        .expect("Python event loop not initialized -- call init_python_event_loop() first")
+}
+
 /// Handle to the Python AsyncOmni engine client.
-///
-/// This wraps the high-level `AsyncOmni` (not the low-level
-/// `AsyncOmniEngine`), so we get the full generate() async generator
-/// with prompt building, sampling params, and output processing.
 pub struct OmniEngine {
-    /// The Python `AsyncOmni` instance.
     engine: PyObject,
     pub model_name: String,
 }
 
-// Safety: OmniEngine holds a PyObject which is Send.
-// All access goes through Python::with_gil().
 unsafe impl Send for OmniEngine {}
 unsafe impl Sync for OmniEngine {}
 
 impl OmniEngine {
-    /// Create an AsyncOmni instance in the embedded Python interpreter.
-    pub fn new(model: &str, kwargs: &serde_json::Map<String, serde_json::Value>) -> Result<Self> {
+    pub fn new(
+        model: &str,
+        kwargs: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self> {
         Python::with_gil(|py| {
             let module = py
                 .import("vllm_omni.entrypoints.async_omni")
-                .context("Failed to import vllm_omni.entrypoints.async_omni")?;
+                .context(
+                    "Failed to import vllm_omni.entrypoints.async_omni",
+                )?;
             let cls = module
                 .getattr("AsyncOmni")
                 .context("Failed to get AsyncOmni class")?;
@@ -47,9 +86,9 @@ impl OmniEngine {
             }
 
             info!("Creating AsyncOmni for model: {model}");
-            let engine = cls
-                .call((), Some(&py_kwargs))
-                .context("Failed to create AsyncOmni. Is vllm-omni installed?")?;
+            let engine = cls.call((), Some(&py_kwargs)).context(
+                "Failed to create AsyncOmni. Is vllm-omni installed?",
+            )?;
 
             info!("AsyncOmni ready");
             Ok(Self {
@@ -59,9 +98,6 @@ impl OmniEngine {
         })
     }
 
-    /// Call AsyncOmni.generate() and return the async generator as a PyObject.
-    ///
-    /// The caller iterates this with `anext()`.
     pub fn generate(
         &self,
         py: Python<'_>,
@@ -77,15 +113,19 @@ impl OmniEngine {
 
     /// Advance a Python async generator by one step.
     ///
-    /// Returns Ok(Some(item)) for the next value, Ok(None) on
-    /// StopAsyncIteration, or Err on failure.
+    /// Uses the background Python event loop via TaskLocals.
     pub async fn anext(generator: &PyObject) -> Result<Option<PyObject>> {
+        let locals = get_task_locals();
+
         let coro = Python::with_gil(|py| -> PyResult<PyObject> {
             generator.call_method0(py, "__anext__")
         })?;
 
         let result = Python::with_gil(|py| {
-            pyo3_async_runtimes::tokio::into_future(coro.into_bound(py))
+            pyo3_async_runtimes::into_future_with_locals(
+                &locals.clone_ref(py),
+                coro.into_bound(py),
+            )
         })?
         .await;
 
@@ -111,30 +151,15 @@ impl OmniEngine {
     }
 }
 
-/// Extract incremental text from an OmniRequestOutput (for future use).
-pub fn extract_text(py: Python<'_>, output: &PyObject) -> Option<String> {
-    let obj = output.bind(py);
-    let request_output = obj.getattr("request_output").ok()?;
-    if request_output.is_none() {
-        return None;
-    }
-    let outputs = request_output.getattr("outputs").ok()?;
-    let list = outputs.downcast::<pyo3::types::PyList>().ok()?;
-    if list.is_empty() {
-        return None;
-    }
-    let first = list.get_item(0).ok()?;
-    first.getattr("text").ok()?.extract().ok()
-}
-
 /// Extract audio tensor bytes from an OmniRequestOutput.
 ///
 /// For Qwen3 TTS, the audio lives at:
 ///   output.multimodal_output["model_outputs"] -> list of float32 tensors
 ///   output.multimodal_output["sr"] -> list of sample rates
-///
-/// Returns (pcm_f32_bytes, sample_rate) for the first audio output.
-pub fn extract_audio(py: Python<'_>, output: &PyObject) -> Option<(Vec<u8>, u32)> {
+pub fn extract_audio(
+    py: Python<'_>,
+    output: &PyObject,
+) -> Option<(Vec<u8>, u32)> {
     let obj = output.bind(py);
 
     let mm_output = obj.getattr("multimodal_output").ok()?;
@@ -145,7 +170,8 @@ pub fn extract_audio(py: Python<'_>, output: &PyObject) -> Option<(Vec<u8>, u32)
     let model_outputs = mm_output.get_item("model_outputs").ok()?;
     let sr_list = mm_output.get_item("sr").ok()?;
 
-    let outputs_list = model_outputs.downcast::<pyo3::types::PyList>().ok()?;
+    let outputs_list =
+        model_outputs.downcast::<pyo3::types::PyList>().ok()?;
     if outputs_list.is_empty() {
         return None;
     }
@@ -159,8 +185,6 @@ pub fn extract_audio(py: Python<'_>, output: &PyObject) -> Option<(Vec<u8>, u32)
         .extract()
         .ok()?;
 
-    // Convert torch tensor to numpy bytes:
-    //   tensor.detach().cpu().float().numpy().tobytes()
     let np_array = tensor
         .call_method0("detach")
         .ok()?
@@ -170,7 +194,8 @@ pub fn extract_audio(py: Python<'_>, output: &PyObject) -> Option<(Vec<u8>, u32)
         .ok()?
         .call_method0("numpy")
         .ok()?;
-    let raw_bytes: Vec<u8> = np_array.call_method0("tobytes").ok()?.extract().ok()?;
+    let raw_bytes: Vec<u8> =
+        np_array.call_method0("tobytes").ok()?.extract().ok()?;
 
     Some((raw_bytes, sr))
 }
