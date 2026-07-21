@@ -49,6 +49,7 @@ thing that has to change to make headless mode support it.
 | File | Role |
 |---|---|
 | `src/main.rs` | CLI parsing, startup sequencing, graceful shutdown |
+| `src/introspect.rs` | One-time startup calls into Python: tokenizer extraction, per-stage sampling defaults |
 | `src/stages.rs` | Spawns headless Python stage processes, kills their process groups on shutdown |
 | `src/master.rs` | `OmniMasterServer`: accepts stage registrations over ZMQ, allocates ports, drives the vLLM engine-core handshake for each stage |
 | `src/routing.rs` | `TtsRouter`: submits a request to both stages concurrently, collects and concatenates the audio |
@@ -103,16 +104,24 @@ thing that has to change to make headless mode support it.
 3. Submit both stages **concurrently**, matching what vllm-omni's Python
    orchestrator does in `_prewarm_async_chunk_stages`:
    - Stage 0 (talker) gets the real placeholder prompt, the
-     `additional_information`, and TTS sampling params
-     (`temperature=0.9, top_p=1.0, top_k=50, repetition_penalty=1.05,
-     max_tokens=4096, min_tokens=2, stop_token_ids=[2150],
-     output_kind=FINAL_ONLY`).
+     `additional_information`, and its sampling params.
    - Stage 1 (code2wav) gets a 1-token placeholder prompt, the *same*
      `additional_information`, `resumable=true` (marks it as a streaming
-     input the connector will keep extending), and vocoder sampling params
-     (`temperature=0.0` greedy, `max_tokens=65536`, `output_kind=DELTA`).
+     input the connector will keep extending), and its sampling params.
    - Both requests share the same `request_id`/`external_req_id` -- that's
      what lets the connector match stage 0's output to stage 1's input.
+   - Per-stage sampling params (`temperature`, `top_p`, `top_k`,
+     `repetition_penalty`, `max_tokens`, `min_tokens`, `stop_token_ids`,
+     `detokenize`) are *not* hardcoded. `introspect.rs` shells out to Python
+     once at startup and calls the exact same
+     `load_and_resolve_stage_configs` function `run_headless()` itself uses,
+     which merges the deploy YAML's `default_sampling_params` with the
+     pipeline topology's `sampling_constraints` (e.g. the talker's
+     `stop_token_ids: [2150]`). `TtsRouter` builds each stage's
+     `EngineCoreSamplingParams` from that at startup; the only thing it adds
+     on top is `output_kind` (`FINAL_ONLY` for stage 0, `DELTA` for stage
+     1), since that's about how *this frontend* consumes the stream, not a
+     model property.
 4. From here on, **Rust does not move any codec data**. Each headless
    stage's own worker process runs vllm-omni's `OmniChunkTransferAdapter` /
    `SharedMemoryConnector`, which writes stage 0's codec chunks to
@@ -285,8 +294,21 @@ print(model.transcribe(audio, fp16=False)['text'])
 
 ## Known limitations
 
-- Hardcoded to a 2-stage Talker -> Code2Wav pipeline (Qwen3-TTS shape);
-  other omni models/pipelines aren't wired up.
+- Hardcoded to a 2-stage Talker -> Code2Wav pipeline (Qwen3-TTS shape).
+  Per-stage *sampling params* are introspected from vllm-omni at startup
+  (see [Request lifecycle](#request-lifecycle-post-v1audiospeech)), so those
+  would already be correct for another 2-stage async_chunk talker/vocoder
+  model (CosyVoice3, Higgs-Audio v2/v3, GLM-TTS, Fish-Speech all use the
+  same pattern). What's still Qwen3-TTS-specific and would need porting:
+  - `additional_information`'s schema (`speech.rs`) --
+    `{text, task_type, language, speaker, instruct}` is
+    `Qwen3TTSPromptEmbedsBuilder`'s input contract specifically, and there's
+    no config to introspect for this, only procedural Python to reimplement.
+  - `TtsRouter::estimate_prompt_len` (`routing.rs`) -- reimplements
+    Qwen3-TTS's exact chat-template token-counting formula; other models
+    compute this differently.
+  - `TtsRouter::new` hard-requires exactly 2 stages and unconditionally
+    treats stage 0 as talker / stage 1 as code2wav.
 - `stream: true` is rejected outright -- responses are always fully
   buffered before being returned.
 - Requires the vllm-omni patch above; there is intentionally no fallback
